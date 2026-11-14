@@ -18,6 +18,7 @@ void fail(const char* expression, int line) {
 
 void* const kIntra = reinterpret_cast<void*>(0x11);
 void* const kInter = reinterpret_cast<void*>(0x22);
+void* const kFramed = reinterpret_cast<void*>(0x33);
 int drcCalls;
 int drCalls;
 int reduceScatterCalls;
@@ -59,33 +60,47 @@ ncclResult_t ncclDecompressReduce(
   return ncclSuccess;
 }
 
-ncclResult_t ncclReduceScatter(
+ncclResult_t ncclReduceScatterConfig(
     const void*, void*, size_t recvcount, ncclDataType_t datatype,
-    ncclRedOp_t op, ncclComm_t comm, cudaStream_t) {
+    ncclRedOp_t op, ncclComm_t comm, cudaStream_t,
+    const ncclCollConfig_t* config) {
   ++reduceScatterCalls;
   EXPECT(recvcount == 32);
   EXPECT(datatype == ncclFloat32 && op == ncclSum && comm->nRanks == 4);
+  EXPECT(config != nullptr);
   return ncclSuccess;
 }
 
 ncclResult_t ncclCompress(
     void*, const cocclCompressorView&, cocclCompressorView*, int,
-    cudaStream_t) {
+    cudaStream_t, const cocclCompressorScope*) {
   return ncclInternalError;
 }
 
 ncclResult_t ncclDecompress(
-    void*, const cocclCompressorView&, cocclCompressorView*, cudaStream_t) {
+    void*, const cocclCompressorView&, cocclCompressorView*, cudaStream_t,
+    const cocclCompressorScope*) {
   return ncclInternalError;
 }
 
-ncclResult_t ncclAllToAll(const void*, void*, size_t, ncclDataType_t,
-                          ncclComm_t, cudaStream_t) {
+bool cocclCompressorSupports(void* compressor, cocclCompressorCapability capability) {
+  return compressor == kFramed && capability == cocclCompressorCapabilityFramed;
+}
+
+bool cocclFrameMetadataValid(
+    const cocclCompressorFrameMetadata&, size_t) {
+  return true;
+}
+
+ncclResult_t ncclAlltoAllConfig(
+    const void*, void*, size_t, ncclDataType_t, ncclComm_t, cudaStream_t,
+    const ncclCollConfig_t*) {
   return ncclInternalError;
 }
 
-ncclResult_t ncclAllGather(const void*, void*, size_t, ncclDataType_t,
-                           ncclComm_t, cudaStream_t) {
+ncclResult_t ncclAllGatherConfig(
+    const void*, void*, size_t, ncclDataType_t, ncclComm_t, cudaStream_t,
+    const ncclCollConfig_t*) {
   return ncclInternalError;
 }
 
@@ -96,12 +111,13 @@ ncclResult_t cocclLaunchPackSlice(
 }
 
 ncclResult_t cocclLaunchUnpackSlice(
-    const void*, void*, size_t, size_t, size_t, cudaStream_t) {
+    const void*, void*, size_t, size_t, size_t,
+    cocclPipelineOutputLayout, int, int, cudaStream_t) {
   return ncclInternalError;
 }
 
 ncclResult_t cocclBuildAllToAllFrameExchanges(
-    const void*, void*, size_t, size_t, int,
+    const void*, void*, size_t, size_t, ncclComm_t, cudaStream_t,
     const cocclCompressorFrameMetadata*,
     const cocclCompressorFrameMetadata*, cocclFrameExchange*, size_t,
     size_t*) {
@@ -109,7 +125,7 @@ ncclResult_t cocclBuildAllToAllFrameExchanges(
 }
 
 ncclResult_t cocclBuildAllGatherFrameExchanges(
-    const void*, void*, size_t, size_t, int,
+    const void*, void*, size_t, size_t, ncclComm_t, cudaStream_t,
     const cocclCompressorFrameMetadata*,
     const cocclCompressorFrameMetadata*, cocclFrameExchange*, size_t,
     size_t*) {
@@ -117,8 +133,27 @@ ncclResult_t cocclBuildAllGatherFrameExchanges(
 }
 
 ncclResult_t cocclCommitFrameExchange(
+    const cocclFrameExchange*, size_t) {
+  return ncclInternalError;
+}
+
+ncclResult_t cocclCommitAllGatherVFrameExchange(
     const cocclFrameExchange*, size_t, ncclComm_t, cudaStream_t) {
   return ncclInternalError;
+}
+
+ncclResult_t cocclCommitAllToAllRmaFrameExchange(
+    const cocclFrameExchange*, size_t, size_t, int, ncclWindow_t, size_t,
+    ncclWaitSignalDesc_t*, ncclComm_t, cudaStream_t) {
+  return ncclInternalError;
+}
+
+int64_t ncclParamAllgathervEnable() {
+  return 0;
+}
+
+int64_t ncclParamEnqueueRearchEnable() {
+  return 0;
 }
 
 int main() {
@@ -129,7 +164,8 @@ int main() {
   intra.nRanks = 4;
   const cocclPipelineStageContext context = {
       16, 64, 256, ncclFloat32, &owner, nullptr,
-      cocclPipelineInputContiguous, 2, 4};
+      cocclPipelineInputContiguous, cocclPipelineOutputContiguous,
+      2, 4};
 
   cocclPipelineEdge encoded = {
       reinterpret_cast<void*>(0x100000), 64, 64, ncclInt8, 8,
@@ -162,6 +198,40 @@ int main() {
   EXPECT(raw.logicalChunks == 2 && raw.totalElements == 32);
   EXPECT(raw.compressor == nullptr && raw.bytes == 128);
 
+  // Full-size Encoded still enters the decoder (subAdd initialization).
+  cocclPipelineStage recv = cocclPipelineSendRecv(&intra, 1, cocclPipelineRecv, kInter);
+  cocclCompressorFrameMetadata metadata = {128, cocclCompressorFrameEncoded, 0};
+  cocclPipelineEdge received = {};
+  received.logicalChunks = 1;
+  cocclPipelineApplyReceivedFrame(recv, metadata, &received, output);
+  EXPECT(received.ptr == output.ptr && received.compressor == kInter);
+  EXPECT(received.bytes == 128 && received.totalElements == 128);
+  EXPECT(received.datatype == ncclInt8 && received.logicalChunks == 1);
+  EXPECT(received.frameMetadata == nullptr && received.frameStrideBytes == 0);
+  metadata = {64, cocclCompressorFrameRaw, 0};
+  cocclPipelineApplyReceivedFrame(recv, metadata, &received, output);
+  EXPECT(received.bytes == 64 && received.totalElements == 64);
+  EXPECT(received.datatype == COCCL_COMPRESSOR_RAW_PASSTHROUGH);
+
+  recv.compressor = kFramed;
+  output.frameMetadata = &metadata;
+  output.frameStrideBytes = output.capacityBytes;
+  const uint32_t encodings[] = {cocclCompressorFrameRaw, cocclCompressorFrameEncoded};
+  for (uint32_t encoding : encodings) {
+    metadata = {64, encoding, 0};
+    cocclPipelineApplyReceivedFrame(recv, metadata, &received, output);
+    EXPECT(received.compressor == kFramed && received.datatype == ncclInt8);
+    EXPECT(received.bytes == output.capacityBytes);
+    EXPECT(received.totalElements == output.capacityBytes && received.logicalChunks == 1);
+    EXPECT(received.frameMetadata == &metadata);
+    EXPECT(received.frameStrideBytes == output.frameStrideBytes);
+  }
+
   std::printf("coccl codec flow: PASS\n");
   return 0;
+}
+
+bool cocclBackendUseAllGatherV(
+    ncclComm_t, const cocclFrameExchange*, size_t) {
+  return false;
 }

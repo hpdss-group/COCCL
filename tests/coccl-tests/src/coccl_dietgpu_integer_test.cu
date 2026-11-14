@@ -1,7 +1,10 @@
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <mpi.h>
 #include <nccl.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -14,9 +17,59 @@ namespace {
 constexpr size_t kCorrectnessElements = 4096;
 int gWorldRank = 0;
 
+__global__ void fillRatio130Kernel(unsigned char* data, size_t bytes,
+                                   uint32_t seed) {
+  for (size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+       index < bytes; index += (size_t)blockDim.x * gridDim.x) {
+    uint32_t value = static_cast<uint32_t>(index) ^
+        static_cast<uint32_t>(index >> 32) ^ seed;
+    value ^= value >> 16;
+    value *= 0x7feb352du;
+    value ^= value >> 15;
+    data[index] = static_cast<unsigned char>(value & 0x3f);
+  }
+}
+__global__ void fillFp32Ratio130Kernel(float* data, size_t elements,
+                                       uint32_t seed) {
+  for (size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+       index < elements; index += (size_t)blockDim.x * gridDim.x) {
+    uint32_t state = static_cast<uint32_t>(index) ^
+        static_cast<uint32_t>(index >> 32) ^ seed;
+    state ^= state >> 16;
+    state *= 0x7feb352du;
+    state ^= state >> 15;
+    const uint32_t bits = 0x3f800000u | (state & 0x007fffffu);
+    data[index] = __uint_as_float(bits);
+  }
+}
+
+
+__global__ void countMismatchKernel(
+    const unsigned char* expected, const unsigned char* actual,
+    size_t bytes, unsigned long long* mismatches) {
+  __shared__ unsigned long long blockCounts[256];
+  unsigned long long count = 0;
+  for (size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+       index < bytes; index += (size_t)blockDim.x * gridDim.x) {
+    count += expected[index] != actual[index];
+  }
+  blockCounts[threadIdx.x] = count;
+  __syncthreads();
+  for (int width = blockDim.x / 2; width > 0; width /= 2) {
+    if (threadIdx.x < width) {
+      blockCounts[threadIdx.x] += blockCounts[threadIdx.x + width];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0 && blockCounts[0] != 0) {
+    atomicAdd(mismatches, blockCounts[0]);
+  }
+}
+
 enum class Operation {
   AllToAll,
   AllGather,
+  AllGatherTwoShot,
   ReduceScatterOneShot,
   ReduceScatterTwoShot,
   AllReduceOneShot,
@@ -33,6 +86,7 @@ struct Options {
   std::string path = "compressed";
   std::string pattern = "compressible";
   size_t elements = 0;
+  size_t prewarmElements = 0;
   int warmups = 20;
   int iterations = 30;
   int depth = 1;
@@ -72,6 +126,10 @@ void fail(const char* expression, const char* detail,
     }                                                                         \
   } while (0)
 
+int byteKernelBlocks(size_t bytes) {
+  return static_cast<int>(std::min<size_t>(65535, (bytes + 255) / 256));
+}
+
 Options parseOptions(int argc, char** argv) {
   Options options;
   for (int index = 1; index + 1 < argc; index += 2) {
@@ -84,6 +142,8 @@ Options parseOptions(int argc, char** argv) {
     else if (key == "--pattern") options.pattern = value;
     else if (key == "--elements") {
       options.elements = std::strtoull(value.c_str(), nullptr, 10);
+    } else if (key == "--prewarm-elements") {
+      options.prewarmElements = std::strtoull(value.c_str(), nullptr, 10);
     } else if (key == "--warmups") {
       options.warmups = std::atoi(value.c_str());
     } else if (key == "--iterations") {
@@ -104,6 +164,7 @@ const char* operationName(Operation operation) {
   switch (operation) {
     case Operation::AllToAll: return "alltoall";
     case Operation::AllGather: return "allgather";
+    case Operation::AllGatherTwoShot: return "allgather-twoshot";
     case Operation::ReduceScatterOneShot: return "reducescatter-oneshot";
     case Operation::ReduceScatterTwoShot: return "reducescatter-twoshot";
     case Operation::AllReduceOneShot: return "allreduce-oneshot";
@@ -118,6 +179,7 @@ const char* operationName(Operation operation) {
 Operation parseOperation(const std::string& value) {
   if (value == "alltoall") return Operation::AllToAll;
   if (value == "allgather") return Operation::AllGather;
+  if (value == "allgather-twoshot") return Operation::AllGatherTwoShot;
   if (value == "reducescatter" || value == "reducescatter-oneshot") {
     return Operation::ReduceScatterOneShot;
   }
@@ -138,7 +200,10 @@ Operation parseOperation(const std::string& value) {
 }
 
 size_t outputElements(Operation operation, size_t elements, int ranks) {
-  if (operation == Operation::AllGather) return elements * ranks;
+  if (operation == Operation::AllGather ||
+      operation == Operation::AllGatherTwoShot) {
+    return elements * ranks;
+  }
   if (operation == Operation::ReduceScatterOneShot ||
       operation == Operation::ReduceScatterTwoShot) {
     return elements / ranks;
@@ -169,15 +234,45 @@ std::vector<T> makeInput(int rank, size_t elements, bool compressible) {
   return values;
 }
 
+template <typename T>
+std::vector<T> makeRandomInput(int rank, size_t elements) {
+  std::vector<T> values(elements);
+  uint32_t state = 0x9e3779b9u ^ static_cast<uint32_t>(rank + 1);
+  auto* bytes = reinterpret_cast<unsigned char*>(values.data());
+  for (size_t index = 0; index < elements * sizeof(T); ++index) {
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    bytes[index] = static_cast<unsigned char>(state);
+  }
+  return values;
+}
+
+template <typename T>
+void fillRatio130Device(T* input, size_t elements, int rank) {
+  const size_t bytes = elements * sizeof(T);
+  fillRatio130Kernel<<<byteKernelBlocks(bytes), 256>>>(
+      reinterpret_cast<unsigned char*>(input), bytes,
+      0x85ebca6bu ^ static_cast<uint32_t>(rank + 1));
+}
+
+template <>
+void fillRatio130Device<float>(float* input, size_t elements, int rank) {
+  fillFp32Ratio130Kernel<<<byteKernelBlocks(elements * sizeof(float)), 256>>>(
+      input, elements, 0x85ebca6bu ^ static_cast<uint32_t>(rank + 1));
+}
+
+
 void runPublic(Operation operation, const void* input, void* output,
                size_t elements, ncclDataType_t datatype, ncclComm_t comm,
                cudaStream_t stream, int rank, int ranks) {
   switch (operation) {
     case Operation::AllToAll:
-      NCCLCHECK(ncclAllToAll(input, output, elements / ranks, datatype,
-                             comm, stream));
+      NCCLCHECK(ncclAlltoAll(input, output, elements / ranks, datatype,
+                            comm, stream));
       return;
     case Operation::AllGather:
+    case Operation::AllGatherTwoShot:
       NCCLCHECK(ncclAllGather(input, output, elements, datatype,
                               comm, stream));
       return;
@@ -218,6 +313,10 @@ void runCompressed(Operation operation, const void* input, void* output,
       NCCLCHECK(cocclAllGatherComp(input, output, elements, datatype,
                                    comm, stream));
       return;
+    case Operation::AllGatherTwoShot:
+      NCCLCHECK(cocclAllGatherCompTwoShot(
+          input, output, elements, datatype, comm, stream));
+      return;
     case Operation::ReduceScatterOneShot:
       NCCLCHECK(cocclReduceScatterCompOneShot(
           input, output, elements / ranks, datatype, ncclSum, comm, stream));
@@ -255,11 +354,35 @@ void runCompressed(Operation operation, const void* input, void* output,
 }
 
 template <typename T>
+void prewarmCompressed(
+    Operation operation, ncclDataType_t datatype, const Options& options,
+    ncclComm_t comm, cudaStream_t stream, int rank, int ranks) {
+  if (options.prewarmElements == 0) return;
+  const size_t inputElements = options.prewarmElements;
+  const size_t resultElements = outputElements(
+      operation, inputElements, ranks);
+  T* input = nullptr;
+  T* output = nullptr;
+  CUDACHECK(cudaMalloc(&input, inputElements * sizeof(T)));
+  CUDACHECK(cudaMalloc(&output, resultElements * sizeof(T)));
+  CUDACHECK(cudaMemset(input, 0, inputElements * sizeof(T)));
+  CUDACHECK(cudaMemset(output, 0, resultElements * sizeof(T)));
+  runCompressed(operation, input, output, inputElements, datatype,
+                comm, stream, rank, ranks);
+  CUDACHECK(cudaStreamSynchronize(stream));
+  CUDACHECK(cudaFree(output));
+  CUDACHECK(cudaFree(input));
+}
+
+template <typename T>
 void runCorrectnessCase(Operation operation, ncclDataType_t datatype,
                         const Options& options, ncclComm_t nativeComm,
                         ncclComm_t compressedComm, cudaStream_t nativeStream,
                         cudaStream_t compressedStream, int rank, int ranks) {
-  const size_t inputElements = kCorrectnessElements;
+  prewarmCompressed<T>(operation, datatype, options, compressedComm,
+                       compressedStream, rank, ranks);
+  const size_t inputElements = options.elements == 0
+      ? kCorrectnessElements : options.elements;
   const size_t resultElements = outputElements(operation, inputElements,
                                                ranks);
   const size_t inputBytes = inputElements * sizeof(T);
@@ -270,9 +393,20 @@ void runCorrectnessCase(Operation operation, ncclDataType_t datatype,
   CUDACHECK(cudaMalloc(&input, inputBytes));
   CUDACHECK(cudaMalloc(&nativeOutput, outputBytes));
   CUDACHECK(cudaMalloc(&compressedOutput, outputBytes));
-  const std::vector<T> hostInput = makeInput<T>(rank, inputElements, false);
-  CUDACHECK(cudaMemcpy(input, hostInput.data(), inputBytes,
-                       cudaMemcpyHostToDevice));
+  if (options.pattern == "ratio130") {
+    fillRatio130Device(input, inputElements, rank);
+    CUDACHECK(cudaGetLastError());
+  } else {
+    const std::vector<T> hostInput = options.pattern == "mixed"
+        ? (rank % 2 == 0
+               ? makeInput<T>(rank, inputElements, true)
+               : makeRandomInput<T>(rank, inputElements))
+        : (options.pattern == "random"
+               ? makeRandomInput<T>(rank, inputElements)
+               : makeInput<T>(rank, inputElements, false));
+    CUDACHECK(cudaMemcpy(input, hostInput.data(), inputBytes,
+                         cudaMemcpyHostToDevice));
+  }
   CUDACHECK(cudaMemset(nativeOutput, 0, outputBytes));
   CUDACHECK(cudaMemset(compressedOutput, 0, outputBytes));
 
@@ -285,16 +419,18 @@ void runCorrectnessCase(Operation operation, ncclDataType_t datatype,
                 compressedComm, compressedStream, rank, ranks);
   CUDACHECK(cudaStreamSynchronize(compressedStream));
 
-  std::vector<T> nativeHost(resultElements);
-  std::vector<T> compressedHost(resultElements);
-  CUDACHECK(cudaMemcpy(nativeHost.data(), nativeOutput, outputBytes,
-                       cudaMemcpyDeviceToHost));
-  CUDACHECK(cudaMemcpy(compressedHost.data(), compressedOutput, outputBytes,
-                       cudaMemcpyDeviceToHost));
+  unsigned long long* deviceMismatches = nullptr;
+  CUDACHECK(cudaMalloc(&deviceMismatches, sizeof(*deviceMismatches)));
+  CUDACHECK(cudaMemset(deviceMismatches, 0, sizeof(*deviceMismatches)));
+  countMismatchKernel<<<byteKernelBlocks(outputBytes), 256>>>(
+      reinterpret_cast<const unsigned char*>(nativeOutput),
+      reinterpret_cast<const unsigned char*>(compressedOutput), outputBytes,
+      deviceMismatches);
+  CUDACHECK(cudaGetLastError());
   unsigned long long localMismatches = 0;
-  for (size_t index = 0; index < resultElements; ++index) {
-    localMismatches += nativeHost[index] != compressedHost[index];
-  }
+  CUDACHECK(cudaMemcpy(&localMismatches, deviceMismatches,
+                       sizeof(localMismatches), cudaMemcpyDeviceToHost));
+  CUDACHECK(cudaFree(deviceMismatches));
   unsigned long long mismatches = 0;
   MPICHECK(MPI_Reduce(&localMismatches, &mismatches, 1,
                       MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD));
@@ -324,9 +460,11 @@ void runCorrectness(const Options& options, ncclDataType_t datatype,
   std::vector<Operation> operations;
   if (options.operation == "all") {
     operations = {
+        Operation::AllReduceOneShot,
         Operation::AllToAll, Operation::AllGather,
+        Operation::AllGatherTwoShot,
         Operation::ReduceScatterOneShot, Operation::ReduceScatterTwoShot,
-        Operation::AllReduceOneShot, Operation::AllReduceTwoShot,
+        Operation::AllReduceTwoShot,
         Operation::AllReduceTripleShot, Operation::SendRecv,
         Operation::SendRecvCrossNode};
   } else {
@@ -388,6 +526,8 @@ void runPerformance(const Options& options, ncclDataType_t datatype,
                     ncclComm_t comm, cudaStream_t stream,
                     int rank, int ranks) {
   const Operation operation = parseOperation(options.operation);
+  prewarmCompressed<T>(operation, datatype, options, comm, stream,
+                       rank, ranks);
   const size_t elements = options.elements;
   const size_t resultElements = outputElements(operation, elements, ranks);
   const size_t inputBytes = elements * sizeof(T);
@@ -396,20 +536,18 @@ void runPerformance(const Options& options, ncclDataType_t datatype,
   T* output = nullptr;
   CUDACHECK(cudaMalloc(&input, inputBytes));
   CUDACHECK(cudaMalloc(&output, outputBytes));
-  if (options.pattern == "compressible") {
+  const bool random = options.pattern == "random" ||
+      (options.pattern == "mixed" && rank % 2 != 0);
+  if (options.pattern == "compressible" ||
+      (options.pattern == "mixed" && !random)) {
     CUDACHECK(cudaMemset(input, 0, inputBytes));
-  } else if (options.pattern == "random") {
-    std::vector<T> hostInput(elements);
-    uint32_t state = 0x9e3779b9u ^ static_cast<uint32_t>(rank + 1);
-    auto* bytes = reinterpret_cast<unsigned char*>(hostInput.data());
-    for (size_t index = 0; index < inputBytes; ++index) {
-      state ^= state << 13;
-      state ^= state >> 17;
-      state ^= state << 5;
-      bytes[index] = static_cast<unsigned char>(state);
-    }
+  } else if (random) {
+    const std::vector<T> hostInput = makeRandomInput<T>(rank, elements);
     CUDACHECK(cudaMemcpy(input, hostInput.data(), inputBytes,
                          cudaMemcpyHostToDevice));
+  } else if (options.pattern == "ratio130") {
+    fillRatio130Device(input, elements, rank);
+    CUDACHECK(cudaGetLastError());
   } else {
     fail("pattern", "unknown input pattern", __FILE__, __LINE__);
   }
@@ -524,6 +662,16 @@ int main(int argc, char** argv) {
   } else if (options.datatype == "int64") {
     dispatch<int64_t>(options, ncclInt64, nativeComm, compressedComm,
                       nativeStream, compressedStream, rank, ranks);
+  } else if (options.datatype == "fp16") {
+    dispatch<__half>(options, ncclFloat16, nativeComm, compressedComm,
+                     nativeStream, compressedStream, rank, ranks);
+  } else if (options.datatype == "bf16") {
+    dispatch<__nv_bfloat16>(options, ncclBfloat16, nativeComm,
+                            compressedComm, nativeStream, compressedStream,
+                            rank, ranks);
+  } else if (options.datatype == "fp32") {
+    dispatch<float>(options, ncclFloat32, nativeComm, compressedComm,
+                    nativeStream, compressedStream, rank, ranks);
   } else {
     fail("datatype", "unknown datatype", __FILE__, __LINE__);
   }

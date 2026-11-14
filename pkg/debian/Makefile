@@ -1,7 +1,8 @@
 #
-# Copyright (c) 2015-2019, NVIDIA CORPORATION. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2015-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 #
-# See LICENSE.txt for license information
+# See LICENSE.txt for more license information
 #
 
 include ../../makefiles/common.mk
@@ -25,7 +26,7 @@ prep : $(DEBTARGETS)
 build : prep
 	$(MAKE) -C ../.. src.build BUILDDIR=$(BUILDDIR)
 	@printf "Building Debian package\n"
-	(cd $(BUILDDIR); debuild -eLD_LIBRARY_PATH -uc -us -d -b)
+	(cd $(BUILDDIR); debuild -eLD_LIBRARY_PATH -uc -us -d -b -Zxz)
 	mkdir -p $(PKGDIR)
 	mv $(BUILDDIR)/../libnccl*.deb $(PKGDIR)/
 

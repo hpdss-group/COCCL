@@ -1,4 +1,6 @@
 #include "runtime/coccl_runtime.h"
+#include "runtime/coccl_group.h"
+#include "core/backend/coccl_backend_collectives.h"
 
 #include "core/tuning/coccl_autotune.h"
 #include "core/config/coccl_config.h"
@@ -75,9 +77,21 @@ bool totalBytes(const cocclInfo& info,
   return true;
 }
 
-bool tunableReduction(cocclOperation operation) {
-  return operation == cocclOperation::ReduceScatter ||
+bool tunableCollective(cocclOperation operation) {
+  return operation == cocclOperation::AllGather ||
+      operation == cocclOperation::ReduceScatter ||
       operation == cocclOperation::AllReduce;
+}
+
+void ensureAutotuneModels(const cocclInfo& info) {
+  // Collective profiling uses communicator-wide bootstrap exchanges. P2P
+  // only involves matching peers and selects its slice layout locally.
+  if (info.operation == cocclOperation::SendRecv) return;
+  ncclComm_t comm = info.comm;
+  const ncclResult_t result = cocclAutotuneEnsureGlobalModels(comm);
+  if (result != ncclSuccess && comm->rank == 0) {
+    WARN("COCCL autotune profiling failed with %d; using heuristics", result);
+  }
 }
 
 bool sendRecvForward(const cocclInfo& info) {
@@ -86,20 +100,13 @@ bool sendRecvForward(const cocclInfo& info) {
       : info.comm->rank > info.peer;
 }
 
-cocclTrainingRole trainingRole(ncclComm_t comm) {
-  if (!cocclTrainingAssistEnabled()) return cocclTrainingRoleUnknown;
-  cocclTrainingClassification classification;
-  return cocclTrainingAssistQuery(comm, &classification)
-      ? classification.role : cocclTrainingRoleUnknown;
-}
-
-cocclPolicyKey preparedPolicy(const cocclPreparedCall& prepared) {
-  if (prepared.info.operation == cocclOperation::SendRecv &&
-      prepared.trainingRole == cocclTrainingRolePipelineParallel) {
+cocclPolicyKey preparedPolicy(const cocclInfo& info, cocclTrainingRole role) {
+  if (info.operation == cocclOperation::SendRecv &&
+      role == cocclTrainingRolePipelineParallel) {
     return cocclDirectionalPolicy(cocclOperation::SendRecv,
-                                  sendRecvForward(prepared.info));
+                                  sendRecvForward(info));
   }
-  return cocclDefaultPolicy(prepared.info.operation);
+  return cocclDefaultPolicy(info.operation);
 }
 
 const char* compressionScopeName(cocclCompressionScope scope) {
@@ -121,35 +128,43 @@ const char* policyVariantName(cocclPolicyVariant variant) {
   return "unknown";
 }
 
-ncclResult_t resolvePreparedCompressors(cocclPreparedCall* prepared) {
-  prepared->policy = preparedPolicy(*prepared);
-  prepared->compressors = {};
+ncclResult_t prepareCall(const cocclInfo& info,
+                         const cocclOperationDescriptor* descriptor,
+                         cocclPreparedCall* prepared,
+                         size_t* thresholdBytes) {
+  prepared->info = info;
+  cocclTrainingRole role = cocclTrainingRoleUnknown;
+  if (cocclTrainingAssistEnabled()) {
+    cocclTrainingClassification classification;
+    if (!cocclTrainingAssistQuery(info.comm, &classification) ||
+        classification.role == cocclTrainingRoleUnknown) {
+      return ncclInvalidUsage;
+    }
+    role = classification.role;
+  }
+
+  const cocclPolicyKey policy = preparedPolicy(info, role);
   for (cocclCompressionScope scope : {
            cocclCompressionScope::Default,
            cocclCompressionScope::Intra,
            cocclCompressionScope::Inter}) {
     cocclResolvedCompressorPolicy resolved = {};
     if (cocclResolveCompressorPolicy(
-            prepared->trainingRole,
-            cocclPolicyForScope(prepared->policy, scope),
+            role, cocclPolicyForScope(policy, scope),
             &resolved) != ncclSuccess) {
       continue;
     }
     const size_t index = static_cast<size_t>(scope);
     prepared->compressors.handles[index] = resolved.compressor;
     prepared->compressors.datatypeSupported[index] =
-        compressorDatatypeSupported(
-            prepared->info.datatype, resolved.compressor);
-    prepared->compressors.thresholdBytes = resolved.thresholdBytes;
+        compressorDatatypeSupported(info.datatype, resolved.compressor);
+    *thresholdBytes = resolved.thresholdBytes;
     INFO(COCCL_RUNTIME,
          "COCCL route comm=%p hash=%llu role=%s operation=%s policy=%s "
          "scope=%s compressor=%s",
-         prepared->info.comm,
-         (unsigned long long)prepared->info.comm->commHash,
-         cocclTrainingRoleName(prepared->trainingRole),
-         prepared->descriptor->name,
-         policyVariantName(prepared->policy.variant),
-         compressionScopeName(scope),
+         info.comm, (unsigned long long)info.comm->commHash,
+         cocclTrainingRoleName(role), descriptor->name,
+         policyVariantName(policy.variant), compressionScopeName(scope),
          cocclCompressorDescriptor(resolved.compressor)->name);
   }
   return prepared->compressors.anyEnabled()
@@ -166,9 +181,10 @@ bool callSupported(const cocclInfo& info,
   return shapeSupported(info, descriptor);
 }
 
-ncclResult_t routeNativeGroupedSendRecv(
+ncclResult_t routeNativeGroupedCall(
     const cocclInfo& info, bool* isEnqueued) {
-  if (ncclGroupDepth == 0 || info.operation != cocclOperation::SendRecv) {
+  if (ncclGroupDepth == 0 ||
+      (info.operation != cocclOperation::SendRecv && !cocclGroupHasPending())) {
     return ncclSuccess;
   }
   NCCLCHECK(cocclGroupEnqueueNative(&info));
@@ -187,40 +203,36 @@ ncclResult_t cocclEnqueueCheck(const cocclInfo* info, bool* isEnqueued) {
   if (callerGuardActive) return ncclSuccess;
   if (info->comm == nullptr) return ncclSuccess;
 
-  cocclTrainingAssistObserve(info, ncclGroupDepth);
+  cocclTrainingAssistObserve(info);
 
   const cocclOperationDescriptor* descriptor =
       cocclGetOperationDescriptor(info->operation);
   if (descriptor == nullptr || !callSupported(*info, *descriptor)) {
-    return routeNativeGroupedSendRecv(*info, isEnqueued);
+    return routeNativeGroupedCall(*info, isEnqueued);
   }
 
   size_t bytes = 0;
   if (!totalBytes(*info, *descriptor, &bytes)) {
-    return routeNativeGroupedSendRecv(*info, isEnqueued);
+    return routeNativeGroupedCall(*info, isEnqueued);
   }
 
   cocclPreparedCall prepared;
-  prepared.info = *info;
-  prepared.descriptor = descriptor;
-  prepared.trainingRole = trainingRole(info->comm);
-  if (cocclTrainingAssistEnabled() &&
-      prepared.trainingRole == cocclTrainingRoleUnknown) {
-    return routeNativeGroupedSendRecv(*info, isEnqueued);
+  size_t thresholdBytes = 0;
+  if (prepareCall(*info, descriptor, &prepared, &thresholdBytes) != ncclSuccess) {
+    return routeNativeGroupedCall(*info, isEnqueued);
   }
-  if (resolvePreparedCompressors(&prepared) != ncclSuccess) {
-    return routeNativeGroupedSendRecv(*info, isEnqueued);
+  if (bytes <= thresholdBytes) {
+    return routeNativeGroupedCall(*info, isEnqueued);
   }
-  if (bytes <= prepared.compressors.thresholdBytes) {
-    return routeNativeGroupedSendRecv(*info, isEnqueued);
-  }
-  if (tunableReduction(info->operation)) {
-    if (cocclSelectAlgorithm(&prepared) != ncclSuccess) {
-      return routeNativeGroupedSendRecv(*info, isEnqueued);
+  ensureAutotuneModels(*info);
+  if (tunableCollective(info->operation)) {
+    if (ncclGroupDepth == 0 &&
+        cocclSelectAlgorithm(&prepared) != ncclSuccess) {
+      return routeNativeGroupedCall(*info, isEnqueued);
     }
   } else if (!cocclPreparedAlgorithmSupported(
                  &prepared, cocclAlgorithmNone)) {
-    return routeNativeGroupedSendRecv(*info, isEnqueued);
+    return routeNativeGroupedCall(*info, isEnqueued);
   }
 
   NCCLCHECK(cocclEnqueuePreparedCall(&prepared));
@@ -241,26 +253,25 @@ ncclResult_t cocclEnqueueExplicitCall(
   }
 
   cocclPreparedCall prepared;
-  prepared.info = *info;
-  prepared.descriptor = descriptor;
-  prepared.trainingRole = trainingRole(info->comm);
-  if (cocclTrainingAssistEnabled() &&
-      prepared.trainingRole == cocclTrainingRoleUnknown) {
-    return ncclInvalidUsage;
-  }
+  size_t thresholdBytes = 0;
+  NCCLCHECK(prepareCall(*info, descriptor, &prepared, &thresholdBytes));
+  ensureAutotuneModels(*info);
   prepared.algorithm = algorithm;
-  NCCLCHECK(resolvePreparedCompressors(&prepared));
-  if (algorithm == cocclAlgorithmNone &&
-      tunableReduction(info->operation)) {
+  const bool deferSelection = ncclGroupDepth > 0 &&
+      algorithm == cocclAlgorithmNone && tunableCollective(info->operation);
+  if (!deferSelection && algorithm == cocclAlgorithmNone &&
+      tunableCollective(info->operation)) {
     NCCLCHECK(cocclSelectAlgorithm(&prepared));
   }
-  if (!cocclPreparedAlgorithmHasCompression(
+  if (!deferSelection && !cocclPreparedAlgorithmHasCompression(
           &prepared, prepared.algorithm)) {
     return ncclInvalidUsage;
   }
-  if (!cocclPreparedAlgorithmSupported(
+  if (!deferSelection && !cocclPreparedAlgorithmSupported(
           &prepared, prepared.algorithm)) {
-    return cocclReplayNativeCall(*info);
+    return ncclGroupDepth > 0
+        ? cocclGroupEnqueueNative(info)
+        : cocclReplayNativeCall(*info);
   }
   return cocclEnqueuePreparedCall(&prepared);
 }
@@ -274,24 +285,29 @@ ncclResult_t cocclReplayNativeCall(const cocclInfo& info) {
   const bool previous = callerGuardActive;
   callerGuardActive = true;
 
+  cocclCollectiveConfig config = {};
+  config.userProfilerTag = info.profilerTag;
   ncclResult_t result = ncclInvalidArgument;
   switch (info.operation) {
     case cocclOperation::AllGather:
-      result = ncclAllGather(info.sendbuff, info.recvbuff, info.count,
-                             info.datatype, info.comm, info.stream);
+      result = cocclBackendAllGather(
+          info.sendbuff, info.recvbuff, info.count, info.datatype,
+          info.comm, info.stream, &config);
       break;
     case cocclOperation::ReduceScatter:
-      result = ncclReduceScatter(info.sendbuff, info.recvbuff, info.count,
-                                 info.datatype, info.op, info.comm,
-                                 info.stream);
+      result = cocclBackendReduceScatter(
+          info.sendbuff, info.recvbuff, info.count, info.datatype, info.op,
+          info.comm, info.stream, &config);
       break;
     case cocclOperation::AllReduce:
-      result = ncclAllReduce(info.sendbuff, info.recvbuff, info.count,
-                             info.datatype, info.op, info.comm, info.stream);
+      result = cocclBackendAllReduce(
+          info.sendbuff, info.recvbuff, info.count, info.datatype, info.op,
+          info.comm, info.stream, &config);
       break;
     case cocclOperation::AllToAll:
-      result = ncclAllToAll(info.sendbuff, info.recvbuff, info.count,
-                            info.datatype, info.comm, info.stream);
+      result = cocclBackendAllToAll(
+          info.sendbuff, info.recvbuff, info.count, info.datatype,
+          info.comm, info.stream, &config);
       break;
     case cocclOperation::SendRecv:
       result = info.func == ncclFuncSend
@@ -309,9 +325,20 @@ ncclResult_t cocclReplayNativeCall(const cocclInfo& info) {
 }
 
 ncclResult_t cocclExecutePreparedCall(const cocclPreparedCall* prepared) {
-  if (prepared == nullptr || prepared->descriptor == nullptr ||
-      !prepared->compressors.anyEnabled()) {
+  if (prepared == nullptr || !prepared->compressors.anyEnabled()) {
     return ncclInvalidArgument;
+  }
+
+  cocclPreparedCall selected;
+  if (prepared->algorithm == cocclAlgorithmNone &&
+      tunableCollective(prepared->info.operation)) {
+    selected = *prepared;
+    NCCLCHECK(cocclSelectAlgorithm(&selected));
+    prepared = &selected;
+  }
+  if (!cocclPreparedAlgorithmHasCompression(
+          prepared, prepared->algorithm)) {
+    return cocclReplayNativeCall(prepared->info);
   }
 
   const cocclInfo& info = prepared->info;

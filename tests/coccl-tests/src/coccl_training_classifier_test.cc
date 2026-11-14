@@ -37,6 +37,8 @@ int ppForwardCompressor;
 int ppBackwardCompressor;
 int executionCount = 0;
 cocclPreparedCall lastExecution;
+cocclTrainingRole lastResolvedRole = cocclTrainingRoleUnknown;
+cocclPolicyKey lastResolvedPolicy;
 
 const cocclCompressorPlugin sdp4bitDescriptor = {
     COCCL_COMPRESSOR_ABI_VERSION,
@@ -97,10 +99,15 @@ ncclResult_t captureExecution(const cocclPreparedCall* prepared) {
 
 const cocclConfig& cocclGetConfig() { return testConfig; }
 bool cocclCompressionEnabled() { return true; }
+ncclResult_t cocclAutotuneEnsureGlobalModels(ncclComm_t) {
+  return ncclSuccess;
+}
 
 ncclResult_t cocclResolveCompressorPolicy(
     cocclTrainingRole role, cocclPolicyKey key,
     cocclResolvedCompressorPolicy* resolved) {
+  lastResolvedRole = role;
+  lastResolvedPolicy = key;
   void* compressor = compressorFor(role, key);
   if (compressor == nullptr) return ncclInvalidUsage;
   resolved->compressor = compressor;
@@ -130,6 +137,7 @@ ncclResult_t cocclSelectAlgorithm(cocclPreparedCall* prepared) {
 ncclResult_t cocclGroupEnqueue(const cocclPreparedCall*) {
   return ncclInternalError;
 }
+bool cocclGroupHasPending() { return false; }
 ncclResult_t cocclGroupEnqueueNative(const cocclInfo*) {
   return ncclInternalError;
 }
@@ -149,20 +157,24 @@ ncclResult_t cocclExecuteSendRecv(const cocclPreparedCall* prepared) {
   return captureExecution(prepared);
 }
 
-ncclResult_t ncclAllGather(const void*, void*, size_t, ncclDataType_t,
-                           ncclComm_t, cudaStream_t) {
+ncclResult_t ncclAllGatherConfig(
+    const void*, void*, size_t, ncclDataType_t, ncclComm_t, cudaStream_t,
+    const ncclCollConfig_t*) {
   return ncclSuccess;
 }
-ncclResult_t ncclReduceScatter(const void*, void*, size_t, ncclDataType_t,
-                               ncclRedOp_t, ncclComm_t, cudaStream_t) {
+ncclResult_t ncclReduceScatterConfig(
+    const void*, void*, size_t, ncclDataType_t, ncclRedOp_t, ncclComm_t,
+    cudaStream_t, const ncclCollConfig_t*) {
   return ncclSuccess;
 }
-ncclResult_t ncclAllReduce(const void*, void*, size_t, ncclDataType_t,
-                           ncclRedOp_t, ncclComm_t, cudaStream_t) {
+ncclResult_t ncclAllReduceConfig(
+    const void*, void*, size_t, ncclDataType_t, ncclRedOp_t, ncclComm_t,
+    cudaStream_t, const ncclCollConfig_t*) {
   return ncclSuccess;
 }
-ncclResult_t ncclAllToAll(const void*, void*, size_t, ncclDataType_t,
-                          ncclComm_t, cudaStream_t) {
+ncclResult_t ncclAlltoAllConfig(
+    const void*, void*, size_t, ncclDataType_t, ncclComm_t, cudaStream_t,
+    const ncclCollConfig_t*) {
   return ncclSuccess;
 }
 ncclResult_t ncclSend(const void*, size_t, ncclDataType_t, int,
@@ -190,11 +202,9 @@ struct TraceBuilder {
   void add(uint64_t communicatorId, ncclFunc_t operation, size_t bytes,
            int peer = -1) {
     cocclTrainingTraceEvent event;
-    event.sequence = events.size() + 1;
     event.communicatorId = communicatorId;
     event.operation = operation;
     event.logicalBytes = bytes;
-    event.datatype = ncclFloat32;
     event.peer = peer;
     event.timestampNs = timestampNs;
     timestampNs += 10;
@@ -313,6 +323,53 @@ static int testIterationDetection() {
     fprintf(stderr, "iteration detector accepted a flat inner-layer loop\n");
     return 1;
   }
+
+  std::vector<cocclTrainingTraceEvent> flatTpSequenceParallel(10);
+  std::vector<cocclTrainingTraceEvent> flatSdp(10);
+  for (size_t i = 0; i < flatTpSequenceParallel.size(); ++i) {
+    const bool allGather = (i & 1) != 0;
+    flatTpSequenceParallel[i].communicatorId = 3;
+    flatTpSequenceParallel[i].operation = allGather
+        ? ncclFuncAllGather : ncclFuncReduceScatter;
+    flatTpSequenceParallel[i].logicalBytes = 1ULL << 20;
+    flatTpSequenceParallel[i].timestampNs = i * 10;
+
+    flatSdp[i] = flatTpSequenceParallel[i];
+    flatSdp[i].communicatorId = 4;
+    if (!allGather) flatSdp[i].logicalBytes = 2ULL << 20;
+  }
+  detected.clear();
+  if (cocclTrainingDetectIterations(
+          flatTpSequenceParallel, 5, &detected)) {
+    fprintf(stderr, "iteration detector accepted flat TP RS/AG traffic\n");
+    return 1;
+  }
+  // Local RS/AG activation must not depend on a rank's timing or on whether
+  // every second versus every fourth operation has a long gap.
+  for (int timing : {0, 1, 2}) {
+    std::vector<cocclTrainingTraceEvent> local;
+    uint64_t timestamp = 0;
+    for (size_t i = 0; i < 40; ++i) {
+      auto event = flatTpSequenceParallel[i % flatTpSequenceParallel.size()];
+      const bool gap = timing == 1 ? i % 2 == 0 :
+                       timing == 2 ? i % 4 == 0 : false;
+      timestamp += gap ? 1000 : 10;
+      event.timestampNs = timestamp;
+      local.push_back(event);
+      if (local.size() < 10) continue;
+      detected.clear();
+      if (!cocclTrainingDetectIterations(local, 5, &detected, false) ||
+          detected.size() != 5 || detected[0].end-detected[0].begin != 2) {
+        fprintf(stderr, "local RS/AG activation cycle depends on rank timing\n");
+        return 1;
+      }
+    }
+  }
+  if (!cocclTrainingDetectIterations(flatSdp, 5, &detected) ||
+      detected.size() != 5 || detected[0].end - detected[0].begin != 2) {
+    fprintf(stderr, "iteration detector rejected stable SDP RS/AG traffic\n");
+    return 1;
+  }
   return 0;
 }
 
@@ -351,24 +408,65 @@ static int testCallsPerIterationIgnoresPartialSuffix() {
 
 static int testTensorParallelCommunicationModes() {
   TraceBuilder trace;
+  TraceBuilder sequenceParallelTrace;
   for (int iteration = 0; iteration < 10; ++iteration) {
     trace.beginIteration();
     trace.add(30, ncclFuncAllGather, 1ULL << 20);
     trace.add(31, ncclFuncAllReduce, 2ULL << 20);
     trace.add(31, ncclFuncAllReduce, 2ULL << 20);
     trace.add(30, ncclFuncReduceScatter, 2ULL << 20);
+
+    sequenceParallelTrace.beginIteration();
+    sequenceParallelTrace.add(39, ncclFuncReduceScatter, 1ULL << 20);
+    sequenceParallelTrace.add(39, ncclFuncAllGather, 1ULL << 20);
   }
   trace.finish();
+  sequenceParallelTrace.finish();
 
   const bool savedSequenceParallel = testConfig.training.sequenceParallel;
   testConfig.training.sequenceParallel = false;
   auto results = classify(
       {makeComm(30, 8, 2), makeComm(31, 2, 1)}, trace);
+  testConfig.training.sequenceParallel = true;
+  auto sequenceParallelResults = classify(
+      {makeComm(39, 2, 1)}, sequenceParallelTrace);
   testConfig.training.sequenceParallel = savedSequenceParallel;
   return expectRole(30, cocclTrainingRoleDataParallel, results,
                     "SDP AG/RS") ||
          expectRole(31, cocclTrainingRoleTensorParallel, results,
-                    "TP AllReduce");
+                    "TP AllReduce") ||
+         expectRole(39, cocclTrainingRoleTensorParallel,
+                    sequenceParallelResults, "sequence-parallel TP RS/AG");
+}
+
+static int testBf16DistributedOptimizerBuckets() {
+  TraceBuilder trace;
+  for (int iteration = 0; iteration < 10; ++iteration) {
+    trace.beginIteration();
+    trace.add(40, ncclFuncReduceScatter, 100ULL << 20);
+    trace.add(40, ncclFuncReduceScatter, 200ULL << 20);
+    trace.add(40, ncclFuncAllGather, 200ULL << 20);
+    trace.add(40, ncclFuncAllGather, 100ULL << 20);
+    trace.add(41, ncclFuncReduceScatter, 1ULL << 20);
+    trace.add(41, ncclFuncAllGather, 1ULL << 20);
+  }
+  trace.finish();
+
+  const int savedDp = testConfig.training.dataParallelSize;
+  const int savedTp = testConfig.training.tensorParallelSize;
+  const bool savedSequenceParallel = testConfig.training.sequenceParallel;
+  testConfig.training.dataParallelSize = 2;
+  testConfig.training.tensorParallelSize = 2;
+  testConfig.training.sequenceParallel = true;
+  auto results = classify({makeComm(40, 2, 1), makeComm(41, 2, 1)}, trace);
+  testConfig.training.dataParallelSize = savedDp;
+  testConfig.training.tensorParallelSize = savedTp;
+  testConfig.training.sequenceParallel = savedSequenceParallel;
+
+  return expectRole(40, cocclTrainingRoleDataParallel, results,
+                    "BF16 distributed-optimizer buckets") ||
+         expectRole(41, cocclTrainingRoleTensorParallel, results,
+                    "equal-size sequence-parallel TP");
 }
 
 static int testConfiguredDataParallelStrategies() {
@@ -684,8 +782,8 @@ static int expectRouted(const cocclInfo& info, cocclTrainingRole role,
   bool isEnqueued = false;
   if (cocclEnqueueCheck(&info, &isEnqueued) != ncclSuccess || !isEnqueued ||
       executionCount != previousExecutions + 1 ||
-      lastExecution.trainingRole != role ||
-      lastExecution.policy.variant != variant ||
+      lastResolvedRole != role ||
+      lastResolvedPolicy.variant != variant ||
       lastExecution.compressors.get(
           info.operation == cocclOperation::SendRecv
               ? cocclCompressionScope::Inter
@@ -771,15 +869,15 @@ static int testRoleSpecificCompressorSelection() {
   ppSend.peer = 1;
 
   auto observeIteration = [&]() {
-    cocclTrainingAssistObserve(&dpAllGather, 0);
+    cocclTrainingAssistObserve(&dpAllGather);
     for (int tensorOp = 0; tensorOp < 6; ++tensorOp) {
-      cocclTrainingAssistObserve(&tpAllReduce, 0);
+      cocclTrainingAssistObserve(&tpAllReduce);
     }
     for (int microbatch = 0; microbatch < 4; ++microbatch) {
-      cocclTrainingAssistObserve(&ppRecv, 1);
-      cocclTrainingAssistObserve(&ppSend, 1);
+      cocclTrainingAssistObserve(&ppRecv);
+      cocclTrainingAssistObserve(&ppSend);
     }
-    cocclTrainingAssistObserve(&dpReduceScatter, 0);
+    cocclTrainingAssistObserve(&dpReduceScatter);
     usleep(1000);
   };
 
@@ -787,10 +885,14 @@ static int testRoleSpecificCompressorSelection() {
     observeIteration();
   }
   cocclTrainingClassification activating;
-  if (cocclTrainingAssistQuery(&dp, &activating) ||
-      cocclTrainingAssistQuery(&tp, &activating) ||
-      cocclTrainingAssistQuery(&pp, &activating)) {
-    fprintf(stderr, "training role activated before the common call boundary\n");
+  const bool dpReady = cocclTrainingAssistQuery(&dp, &activating);
+  const bool tpReady = cocclTrainingAssistQuery(&tp, &activating);
+  const bool ppReady = cocclTrainingAssistQuery(&pp, &activating);
+  if (dpReady || tpReady || ppReady) {
+    fprintf(stderr,
+            "training role activated before the common call boundary: "
+            "dp=%d tp=%d pp=%d\n",
+            dpReady, tpReady, ppReady);
     return 1;
   }
   for (int iteration = 10; iteration < 20; ++iteration) {
@@ -799,8 +901,7 @@ static int testRoleSpecificCompressorSelection() {
 
   if (expectCommittedRole(&dp, cocclTrainingRoleDataParallel, "DP") ||
       expectCommittedRole(&tp, cocclTrainingRoleTensorParallel, "TP") ||
-      expectCommittedRole(&pp, cocclTrainingRolePipelineParallel, "PP") ||
-      expectCommittedRole(&unknown, cocclTrainingRoleUnknown, "unknown")) {
+      expectCommittedRole(&pp, cocclTrainingRolePipelineParallel, "PP")) {
     return 1;
   }
 
@@ -852,7 +953,7 @@ static int testRoleSpecificCompressorSelection() {
   if (cocclEnqueueExplicitCall(
           &dpAllGather, cocclAlgorithmNone) != ncclSuccess ||
       executionCount != previousExecutions + 1 ||
-      lastExecution.trainingRole != cocclTrainingRoleDataParallel) {
+      lastResolvedRole != cocclTrainingRoleDataParallel) {
     fprintf(stderr, "explicit COCCL call did not bypass the threshold\n");
     return 1;
   }
@@ -871,6 +972,9 @@ static int testRoleSpecificCompressorSelection() {
 }
 
 static int testRuntimeObservationMinimumBytes() {
+  const size_t savedThreshold =
+      testConfig.runtime.compressionThresholdBytes;
+  testConfig.runtime.compressionThresholdBytes = 0;
   int rankToNode[2] = {0, 0};
   ncclComm comm = {};
   comm.rank = 0;
@@ -887,7 +991,7 @@ static int testRuntimeObservationMinimumBytes() {
       kCocclTrainingMinimumObservedBytes / sizeof(float) - 1,
       buffer, buffer);
   for (int call = 0; call < 256; ++call) {
-    cocclTrainingAssistObserve(&belowMinimum, 0);
+    cocclTrainingAssistObserve(&belowMinimum);
   }
   cocclTrainingClassification classification;
   if (cocclTrainingAssistQuery(&comm, &classification)) {
@@ -895,21 +999,170 @@ static int testRuntimeObservationMinimumBytes() {
     return 1;
   }
 
-  cocclInfo atMinimum = collectiveInfo(
-      &comm, cocclOperation::AllReduce, ncclFuncAllReduce,
-      kCocclTrainingMinimumObservedBytes / sizeof(float),
+  const size_t atMinimumCount =
+      kCocclTrainingMinimumObservedBytes / sizeof(float) / 2;
+  cocclInfo atMinimumReduceScatter = collectiveInfo(
+      &comm, cocclOperation::ReduceScatter, ncclFuncReduceScatter,
+      atMinimumCount, buffer, buffer);
+  cocclInfo atMinimumAllGather = collectiveInfo(
+      &comm, cocclOperation::AllGather, ncclFuncAllGather, atMinimumCount,
       buffer, buffer);
-  for (int iteration = 0; iteration < 10; ++iteration) {
-    cocclTrainingAssistObserve(&atMinimum, 0);
-    cocclTrainingAssistObserve(&atMinimum, 0);
+  for (int iteration = 0; iteration < 20; ++iteration) {
+    cocclTrainingAssistObserve(&atMinimumReduceScatter);
+    cocclTrainingAssistObserve(&atMinimumAllGather);
     usleep(1000);
   }
-  if (!cocclTrainingAssistQuery(&comm, &classification)) {
+  if (!cocclTrainingAssistQuery(&comm, &classification) ||
+      classification.role != cocclTrainingRoleTensorParallel) {
     fprintf(stderr, "1MiB calls were not observed by the training trace\n");
     return 1;
   }
   cocclTrainingAssistUnregister(&comm);
+  testConfig.runtime.compressionThresholdBytes = savedThreshold;
   return 0;
+}
+
+static int testObservationIndependentOfCompressionThreshold(bool overlap) {
+  const size_t savedThreshold =
+      testConfig.runtime.compressionThresholdBytes;
+  const int savedObservationIterations =
+      testConfig.training.observationIterations;
+  const int savedDp = testConfig.training.dataParallelSize;
+  const int savedTp = testConfig.training.tensorParallelSize;
+  const int savedPp = testConfig.training.pipelineParallelSize;
+  testConfig.runtime.compressionThresholdBytes = 64ULL << 20;
+  testConfig.training.dataParallelSize = 2;
+  testConfig.training.tensorParallelSize = 2;
+  testConfig.training.pipelineParallelSize = 2;
+  testConfig.training.observationIterations = 5;
+
+  int localRankToNode[2] = {0, 0};
+  int crossNodeRankToNode[2] = {0, 1};
+  ncclComm tp = {};
+  tp.rank = 0;
+  tp.nRanks = 2;
+  tp.nNodes = 1;
+  tp.localRanks = 2;
+  tp.rankToNode = localRankToNode;
+  tp.commHash = 0x1020;
+
+  ncclComm dp = {};
+  dp.rank = 0;
+  dp.nRanks = 2;
+  dp.nNodes = 2;
+  dp.localRanks = 1;
+  dp.rankToNode = crossNodeRankToNode;
+  dp.commHash = 0x1021;
+
+  ncclComm lateDp = {};
+  lateDp.rank = 0;
+  lateDp.nRanks = 2;
+  lateDp.nNodes = 2;
+  lateDp.localRanks = 1;
+  lateDp.rankToNode = crossNodeRankToNode;
+  lateDp.commHash = 0x1023;
+  ncclComm pp = {};
+  pp.rank = 0;
+  pp.nRanks = 2;
+  pp.nNodes = 2;
+  pp.localRanks = 1;
+  pp.rankToNode = crossNodeRankToNode;
+  pp.commHash = 0x1022;
+
+  float buffer[1] = {};
+  constexpr size_t kTpCount = (1ULL << 20) / sizeof(uint16_t) / 2;
+  constexpr size_t kDpAllGatherCount =
+      (128ULL << 20) / sizeof(uint16_t) / 2;
+  constexpr size_t kDpReduceScatterCount =
+      (256ULL << 20) / sizeof(uint16_t) / 2;
+  cocclInfo tpReduceScatter = collectiveInfo(
+      &tp, cocclOperation::ReduceScatter, ncclFuncReduceScatter,
+      kTpCount, buffer, buffer);
+  cocclInfo tpAllGather = collectiveInfo(
+      &tp, cocclOperation::AllGather, ncclFuncAllGather,
+      kTpCount, buffer, buffer);
+  tpReduceScatter.datatype = ncclBfloat16;
+  tpAllGather.datatype = ncclBfloat16;
+  cocclInfo dpReduceScatter = collectiveInfo(
+      &dp, cocclOperation::ReduceScatter, ncclFuncReduceScatter,
+      kDpReduceScatterCount, buffer, buffer);
+  cocclInfo dpAllGather = collectiveInfo(
+      &dp, cocclOperation::AllGather, ncclFuncAllGather,
+      kDpAllGatherCount, buffer, buffer);
+  dpReduceScatter.datatype = ncclBfloat16;
+  dpAllGather.datatype = ncclBfloat16;
+  cocclInfo ppSend = collectiveInfo(
+      &pp, cocclOperation::SendRecv, ncclFuncSend, 1, buffer, nullptr);
+  ppSend.peer = 1;
+
+  cocclTrainingAssistRegister(&tp);
+  for (int iteration = 0; iteration < 20; ++iteration) {
+    cocclTrainingAssistObserve(&tpReduceScatter);
+    cocclTrainingAssistObserve(&tpAllGather);
+    usleep(1000);
+  }
+  int result = expectCommittedRole(
+      &tp, cocclTrainingRoleTensorParallel,
+      overlap ? "TP before overlapped DP registration"
+              : "TP before DP registration");
+
+  cocclTrainingAssistRegister(&dp);
+  cocclTrainingAssistRegister(&lateDp);
+  cocclTrainingAssistRegister(&pp);
+  cocclTrainingAssistObserve(&ppSend);
+  for (int iteration = 0; iteration < 20; ++iteration) {
+    cocclTrainingAssistObserve(&dpAllGather);
+    if (overlap) {
+      cocclInfo firstBucket = dpReduceScatter;
+      firstBucket.count /= 4;
+      cocclTrainingAssistObserve(&firstBucket);
+      cocclInfo secondBucket = dpReduceScatter;
+      secondBucket.count -= firstBucket.count;
+      cocclTrainingAssistObserve(&secondBucket);
+    } else {
+      cocclTrainingAssistObserve(&dpReduceScatter);
+    }
+    usleep(1000);
+  }
+
+  result |= expectCommittedRole(&dp, cocclTrainingRoleDataParallel,
+                                overlap ? "overlap DP" : "DP") ||
+            expectCommittedRole(&pp, cocclTrainingRolePipelineParallel,
+                                overlap ? "PP with DP overlap" : "PP");
+
+  cocclTrainingClassification lateClassification;
+  if (cocclTrainingAssistQuery(&lateDp, &lateClassification)) {
+    fprintf(stderr, "idle late DP communicator was committed early\n");
+    result = 1;
+  }
+  cocclInfo lateAllGather = dpAllGather;
+  cocclInfo lateReduceScatter = dpReduceScatter;
+  lateAllGather.comm = &lateDp;
+  lateReduceScatter.comm = &lateDp;
+  for (int iteration = 0; iteration < 20; ++iteration) {
+    cocclTrainingAssistObserve(&lateAllGather);
+    cocclTrainingAssistObserve(&lateReduceScatter);
+    usleep(1000);
+  }
+  result |= expectCommittedRole(
+      &lateDp, cocclTrainingRoleDataParallel,
+      overlap ? "late overlap DP" : "late DP");
+
+  cocclTrainingAssistUnregister(&pp);
+  cocclTrainingAssistUnregister(&lateDp);
+  cocclTrainingAssistUnregister(&dp);
+  cocclTrainingAssistUnregister(&tp);
+  testConfig.runtime.compressionThresholdBytes = savedThreshold;
+  testConfig.training.dataParallelSize = savedDp;
+  testConfig.training.tensorParallelSize = savedTp;
+  testConfig.training.pipelineParallelSize = savedPp;
+  testConfig.training.observationIterations = savedObservationIterations;
+  return result;
+}
+
+static int testObservationIndependentOfCompressionThreshold() {
+  return testObservationIndependentOfCompressionThreshold(false) ||
+         testObservationIndependentOfCompressionThreshold(true);
 }
 
 static int testImmediateConfiguredSizeClassification() {
@@ -930,7 +1183,8 @@ static int testImmediateConfiguredSizeClassification() {
   tp.nNodes = 1;
   tp.localRanks = 2;
   tp.commHash = 0x1011;
-  ncclComm pp = tp;
+  ncclComm pp = {};
+  pp.nRanks = 2;
   pp.nNodes = 2;
   pp.localRanks = 1;
   pp.commHash = 0x1012;
@@ -945,7 +1199,7 @@ static int testImmediateConfiguredSizeClassification() {
   ppCall.peer = 1;
 
   cocclTrainingAssistRegister(&dp);
-  cocclTrainingAssistObserve(&dpCall, 0);
+  cocclTrainingAssistObserve(&dpCall);
   int result = expectCommittedRole(
       &dp, cocclTrainingRoleDataParallel, "immediate DP size");
 
@@ -956,7 +1210,7 @@ static int testImmediateConfiguredSizeClassification() {
   clock_gettime(CLOCK_MONOTONIC, &begin);
   for (int call = 0; call < kSteadyCalls; ++call) {
     cocclTrainingClassification classification;
-    cocclTrainingAssistObserve(&dpCall, 0);
+    cocclTrainingAssistObserve(&dpCall);
     if (cocclTrainingAssistQuery(&dp, &classification)) {
       roleSum += classification.role;
     }
@@ -970,13 +1224,13 @@ static int testImmediateConfiguredSizeClassification() {
   cocclTrainingAssistUnregister(&dp);
 
   cocclTrainingAssistRegister(&tp);
-  cocclTrainingAssistObserve(&tpCall, 0);
+  cocclTrainingAssistObserve(&tpCall);
   result |= expectCommittedRole(
       &tp, cocclTrainingRoleTensorParallel, "immediate TP size");
   cocclTrainingAssistUnregister(&tp);
 
   cocclTrainingAssistRegister(&pp);
-  cocclTrainingAssistObserve(&ppCall, 0);
+  cocclTrainingAssistObserve(&ppCall);
   result |= expectCommittedRole(
       &pp, cocclTrainingRolePipelineParallel, "immediate PP size");
   cocclTrainingAssistUnregister(&pp);
@@ -1084,9 +1338,7 @@ static int testOperationDescriptors() {
     const cocclOperationDescriptor* descriptor =
         cocclGetOperationDescriptor(operation);
     if (descriptor == nullptr || descriptor->operation != operation ||
-        descriptor->name == nullptr ||
-        !cocclOperationSupportsPolicy(
-            descriptor, cocclPolicyVariant::Default)) {
+        descriptor->name == nullptr) {
       fprintf(stderr, "operation %d has an incomplete descriptor\n", value);
       return 1;
     }
@@ -1095,21 +1347,12 @@ static int testOperationDescriptors() {
       cocclGetOperationDescriptor(cocclOperation::AllReduce);
   const cocclOperationDescriptor* reduceScatter =
       cocclGetOperationDescriptor(cocclOperation::ReduceScatter);
-  const cocclOperationDescriptor* sendRecv =
-      cocclGetOperationDescriptor(cocclOperation::SendRecv);
   if (cocclGetOperationDescriptor(cocclOperation::Count) != nullptr ||
       !cocclOperationHasTrait(allReduce, cocclOperationTraitReduction) ||
       !cocclOperationHasTrait(
           allReduce, cocclOperationTraitCountDivisibleByRanks) ||
       !cocclOperationHasTrait(
-          reduceScatter, cocclOperationTraitReduction) ||
-      !cocclOperationHasTrait(
-          reduceScatter, cocclOperationTraitHierarchicalPolicy) ||
-      !cocclOperationHasTrait(sendRecv, cocclOperationTraitGrouped) ||
-      !cocclOperationSupportsPolicy(
-          sendRecv, cocclPolicyVariant::Forward) ||
-      cocclOperationSupportsPolicy(
-          allReduce, cocclPolicyVariant::Forward)) {
+          reduceScatter, cocclOperationTraitReduction)) {
     fprintf(stderr, "operation descriptor semantics are inconsistent\n");
     return 1;
   }
@@ -1120,6 +1363,7 @@ static int testOperationDescriptors() {
 
 int main() {
   testConfig.runtime.mode = cocclRuntimeMode::Training;
+  testConfig.runtime.compressionThresholdBytes = 0;
   testConfig.training.observationIterations = 10;
   testConfig.training.dataParallelSize = 31;
   testConfig.training.tensorParallelSize = 29;
@@ -1132,6 +1376,7 @@ int main() {
       testIterationDetection() ||
       testCallsPerIterationIgnoresPartialSuffix() ||
       testTensorParallelCommunicationModes() ||
+      testBf16DistributedOptimizerBuckets() ||
       testConfiguredDataParallelStrategies() ||
       testConfiguredParallelSizes() ||
       testCrossNodeDpAndTp() ||
@@ -1144,6 +1389,7 @@ int main() {
       testQwenTp2Pp2Trace() ||
       testRoleSpecificCompressorSelection() ||
       testRuntimeObservationMinimumBytes() ||
+      testObservationIndependentOfCompressionThreshold() ||
       testImmediateConfiguredSizeClassification() ||
       testAmbiguousConstantCollective()) {
     return 1;

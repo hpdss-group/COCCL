@@ -1,7 +1,18 @@
-#include "core/pipeline/coccl_frame_exchange.h"
+#include "core/communication/coccl_frame_exchange.h"
+#include "core/compression/coccl_compressor_runtime.h"
+
+bool cocclFrameMetadataValid(
+    const cocclCompressorFrameMetadata&, size_t) {
+  return false;
+}
+
+bool cocclCompressorSupports(
+    void*, cocclCompressorCapability) {
+  return false;
+}
 
 ncclResult_t cocclBuildAllToAllFrameExchanges(
-    const void*, void*, size_t, size_t, int,
+    const void*, void*, size_t, size_t, ncclComm_t, cudaStream_t,
     const cocclCompressorFrameMetadata*,
     const cocclCompressorFrameMetadata*, cocclFrameExchange*, size_t,
     size_t*) {
@@ -9,7 +20,7 @@ ncclResult_t cocclBuildAllToAllFrameExchanges(
 }
 
 ncclResult_t cocclBuildAllGatherFrameExchanges(
-    const void*, void*, size_t, size_t, int,
+    const void*, void*, size_t, size_t, ncclComm_t, cudaStream_t,
     const cocclCompressorFrameMetadata*,
     const cocclCompressorFrameMetadata*, cocclFrameExchange*, size_t,
     size_t*) {
@@ -17,12 +28,36 @@ ncclResult_t cocclBuildAllGatherFrameExchanges(
 }
 
 ncclResult_t cocclCommitFrameExchange(
+    const cocclFrameExchange*, size_t) {
+  return ncclInternalError;
+}
+
+ncclResult_t cocclCommitAllGatherVFrameExchange(
     const cocclFrameExchange*, size_t, ncclComm_t, cudaStream_t) {
   return ncclInternalError;
 }
 
-ncclResult_t ncclReduceScatter(
-    const void*, void*, size_t, ncclDataType_t, ncclRedOp_t,
-    ncclComm_t, cudaStream_t) {
+ncclResult_t cocclCommitAllToAllRmaFrameExchange(
+    const cocclFrameExchange*, size_t, size_t, int, ncclWindow_t, size_t,
+    ncclWaitSignalDesc_t*, ncclComm_t, cudaStream_t) {
   return ncclInternalError;
+}
+
+int64_t ncclParamAllgathervEnable() {
+  return 0;
+}
+
+int64_t ncclParamEnqueueRearchEnable() {
+  return 0;
+}
+
+ncclResult_t ncclReduceScatterConfig(
+    const void*, void*, size_t, ncclDataType_t, ncclRedOp_t,
+    ncclComm_t, cudaStream_t, const ncclCollConfig_t*) {
+  return ncclInternalError;
+}
+
+bool cocclBackendUseAllGatherV(
+    ncclComm_t, const cocclFrameExchange*, size_t) {
+  return false;
 }

@@ -10,7 +10,7 @@
 
 // This is the only contract crossing the compressor shared-library boundary.
 // Keep it POD-only: the public C++ SDK adapts user code to these structures.
-constexpr uint32_t COCCL_COMPRESSOR_ABI_VERSION = 8;
+constexpr uint32_t COCCL_COMPRESSOR_ABI_VERSION = 9;
 constexpr uint32_t COCCL_COMPRESSOR_HOST_API_VERSION = 3;
 constexpr const char* COCCL_COMPRESSOR_ENTRY_SYMBOL =
     "cocclGetCompressorPlugin";
@@ -34,6 +34,7 @@ enum cocclCompressorCapability : uint64_t {
   cocclCompressorCapabilityFramed = 1ULL << 4,
   cocclCompressorCapabilityFusedHierarchicalSwizzle = 1ULL << 5,
   cocclCompressorCapabilityBytewiseLossless = 1ULL << 6,
+  cocclCompressorCapabilityPipelineState = 1ULL << 7,
 };
 
 constexpr uint64_t COCCL_COMPRESSOR_REQUIRED_CAPABILITIES =
@@ -122,7 +123,14 @@ struct cocclCompressorExecutionContext {
   int nRanks;
   int nodes;
   int devicesPerNode;
+  // Optional tail, sent only to plugins advertising PipelineState.
+  size_t pipelineSlice;
+  size_t pipelineSlices;
+  int localChunkIndex;
 };
+
+constexpr size_t COCCL_COMPRESSOR_EXECUTION_BASE_SIZE =
+    offsetof(cocclCompressorExecutionContext, pipelineSlice);
 
 struct cocclCompressorCall {
   uint32_t structSize;
@@ -135,6 +143,10 @@ struct cocclCompressorCall {
   size_t originalElements;
   const void* config;
   cocclCompressorExecutionContext* execution;
+  // For DRC, config describes the output encoder and inputConfig describes
+  // the codec that produced input. Other operations use the same config for
+  // both fields.
+  const void* inputConfig;
 };
 
 // Host-only raw shape query used by workspace planning. For DRC, this is the

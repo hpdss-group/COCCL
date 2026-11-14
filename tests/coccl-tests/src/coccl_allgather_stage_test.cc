@@ -28,7 +28,8 @@ void ncclDebugLog(ncclDebugLogLevel, unsigned long, const char*, int,
 
 ncclResult_t ncclCompress(
     void* compressor, const cocclCompressorView& input,
-    cocclCompressorView* output, int, cudaStream_t) {
+    cocclCompressorView* output, int, cudaStream_t,
+    const cocclCompressorScope*) {
   ++compressCalls;
   EXPECT(compressor == reinterpret_cast<void*>(0x1));
   EXPECT(input.elements == 64 && input.chunks == 1 &&
@@ -40,17 +41,20 @@ ncclResult_t ncclCompress(
   return ncclSuccess;
 }
 
-ncclResult_t ncclAllGather(const void*, void*, size_t count,
-                           ncclDataType_t datatype, ncclComm_t comm,
-                           cudaStream_t) {
+ncclResult_t ncclAllGatherConfig(
+    const void*, void*, size_t count, ncclDataType_t datatype,
+    ncclComm_t comm, cudaStream_t, const ncclCollConfig_t* config) {
   ++allGatherCalls;
   EXPECT(count == 32 && datatype == ncclUint8 && comm->nRanks == 4);
+  EXPECT(config != nullptr && config->userProfilerTag == 0x5678 &&
+         config->minCTAs == 9 && config->maxCTAs == 9);
   return ncclSuccess;
 }
 
 ncclResult_t ncclDecompress(
     void* compressor, const cocclCompressorView& input,
-    cocclCompressorView* output, cudaStream_t) {
+    cocclCompressorView* output, cudaStream_t,
+    const cocclCompressorScope*) {
   ++decompressCalls;
   EXPECT(compressor == reinterpret_cast<void*>(0x1));
   EXPECT(input.elements == 128 && input.chunks == 4 &&
@@ -61,8 +65,9 @@ ncclResult_t ncclDecompress(
   return ncclSuccess;
 }
 
-ncclResult_t ncclAllToAll(const void*, void*, size_t, ncclDataType_t,
-                          ncclComm_t, cudaStream_t) {
+ncclResult_t ncclAlltoAllConfig(
+    const void*, void*, size_t, ncclDataType_t, ncclComm_t, cudaStream_t,
+    const ncclCollConfig_t*) {
   return ncclInternalError;
 }
 
@@ -86,7 +91,8 @@ ncclResult_t cocclLaunchPackSlice(const void*, size_t, void*, size_t,
 }
 
 ncclResult_t cocclLaunchUnpackSlice(const void*, void*, size_t, size_t,
-                                    size_t, cudaStream_t) {
+                                    size_t, cocclPipelineOutputLayout,
+                                    int, int, cudaStream_t) {
   return ncclInternalError;
 }
 
@@ -96,10 +102,14 @@ int main() {
   comm.rank = 2;
   const cocclPipelineStageContext context = {
       64, 256, 1024, ncclFloat32, &comm, nullptr,
-      cocclPipelineInputContiguous, 1, 4};
+      cocclPipelineInputContiguous, cocclPipelineOutputContiguous,
+      1, 4, 0x5678};
   cocclPipelineEdge edge = {
       reinterpret_cast<void*>(0x100000), 256, 64, ncclFloat32, 1,
       nullptr, nullptr, 0};
+  cocclCollectiveConfig communicationConfig = {};
+  communicationConfig.minCTAs = 9;
+  communicationConfig.maxCTAs = 9;
 
   const cocclPipelineStage compress = cocclPipelineCompress(reinterpret_cast<void*>(0x1));
   cocclPipelineStageOutput output = {
@@ -109,7 +119,8 @@ int main() {
   EXPECT(compressCalls == 1 && edge.bytes == 32 &&
          edge.totalElements == 32 && edge.logicalChunks == 1);
 
-  const cocclPipelineStage allGather = cocclPipelineAllGather(&comm);
+  const cocclPipelineStage allGather =
+      cocclPipelineAllGather(&comm, &communicationConfig);
   output = {reinterpret_cast<void*>(0x300000), 1024};
   EXPECT(cocclExecutePipelineStage(
              &context, &allGather, &edge, &output, nullptr) == ncclSuccess);

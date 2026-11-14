@@ -10,7 +10,7 @@ Unpack, communication, workspace, and scheduling.
 #include "compressor_plugin/coccl_compressor_plugin.h"
 ```
 
-The current compressor ABI is v8. Plugins include only the public SDK and
+The current compressor ABI is v9. Plugins include only the public SDK and
 their own sources, never `core/` headers.
 
 ## Pick A Layout
@@ -204,13 +204,16 @@ fused reductions and persistent state.
 
 - **SDP4Bit:** `groupCount`, `quantBits = 4|8`,
   `quantType = "Symmetric"|"Asymmetric"`, `hadamard`, and `subAdd`.
-  `pipelineSize` controls subAdd state slots, not COCCL pipeline depth.
+  Pipeline execution assigns subAdd history slots from the actual slices,
+  including automatic depth. `pipelineSize` only controls standalone codec
+  calls outside the pipeline; it does not select COCCL depth.
 - **TACO:** `fp8Format = "E4M3"|"E5M2"`, `saturate`,
   `groupSize = 32|64|128|256|512`, `targetRange`, `lambda`, and optional
   `fp8MaxValue`.
 - **ZFP:** `rate = 1..64` bits per value.
-- **dietGPU:** `probBits = 9|10|11`. It is framed, bytewise lossless, and
-  supports floating-point data plus Int8, Int32, and Int64.
+- **dietGPU:** `probBits = 9|10|11`. It uses dietGPU's floating-point codec
+  for FP16, BF16, and FP32, and bytewise ANS for Int8, Int32, and Int64.
+  Both paths are framed and lossless.
 
 Unknown parameters are rejected. The examples in
 [`../configs`](../configs) are the authoritative policy configurations.

@@ -17,11 +17,13 @@ struct FakeEvent {
 
 std::map<void*, size_t> allocations;
 std::set<void*> registrations;
+std::set<ncclWindow_t> windows;
 std::set<cudaEvent_t> events;
 cocclConfig config;
 bool failNextRegistration = false;
 bool failNextEventRecord = false;
 bool completeRecordedEvents = true;
+bool windowRegistrationEnabled = true;
 void* lastAllocation = nullptr;
 
 void fail(const char* expression, int line) {
@@ -56,12 +58,14 @@ ncclResult_t vmmInit(VmmPool*, ncclComm_t, bool* available) {
   return ncclSuccess;
 }
 
-ncclResult_t vmmAcquire(VmmPool*, ncclComm_t, size_t, cudaStream_t,
+ncclResult_t vmmAcquire(VmmPool*, ncclComm_t,
+                        cocclBufferRegistrationKind, size_t, cudaStream_t,
                         cocclBufferHandle*) {
   return ncclInternalError;
 }
 
-ncclResult_t vmmRegister(cocclBufferHandle*, ncclComm_t) {
+ncclResult_t vmmRegister(cocclBufferHandle*, ncclComm_t,
+                         cocclBufferRegistrationKind) {
   return ncclInternalError;
 }
 
@@ -108,6 +112,24 @@ extern "C" ncclResult_t ncclCommRegister(const ncclComm_t, void*, size_t,
 extern "C" ncclResult_t ncclCommDeregister(const ncclComm_t, void* handle) {
   registrations.erase(handle);
   std::free(handle);
+  return ncclSuccess;
+}
+
+extern "C" ncclResult_t ncclCommWindowRegister(
+    ncclComm_t, void*, size_t, ncclWindow_t* window, int) {
+  if (!windowRegistrationEnabled) {
+    *window = nullptr;
+    return ncclSuccess;
+  }
+  *window = reinterpret_cast<ncclWindow_t>(std::malloc(1));
+  windows.insert(*window);
+  return ncclSuccess;
+}
+
+extern "C" ncclResult_t ncclCommWindowDeregister(
+    ncclComm_t, ncclWindow_t window) {
+  windows.erase(window);
+  std::free(window);
   return ncclSuccess;
 }
 
@@ -171,6 +193,27 @@ int main() {
   cocclBufferHandle concurrent;
   EXPECT(cocclGetBuffer(&firstComm, 1024, firstStream, &first) ==
          ncclSuccess);
+  EXPECT(registrations.size() == 1);
+  EXPECT(cocclRegisterBufferForComm(
+             &first, &secondComm,
+             cocclBufferRegistrationKind::Ordinary) == ncclSuccess);
+  EXPECT(registrations.size() == 2);
+  EXPECT(cocclRegisterBufferForComm(
+             &first, &secondComm,
+             cocclBufferRegistrationKind::Symmetric) == ncclSuccess);
+  EXPECT(registrations.size() == 2 && windows.size() == 1);
+  cocclBufferRmaInfo rmaInfo;
+  EXPECT(cocclGetBufferRmaInfo(first, &secondComm, &rmaInfo));
+  EXPECT(rmaInfo.window != nullptr && rmaInfo.bufferOffset == 0 &&
+         rmaInfo.singleSegment);
+  EXPECT(cocclRegisterBufferForComm(
+             &first, &secondComm,
+             cocclBufferRegistrationKind::Symmetric) == ncclSuccess);
+  EXPECT(registrations.size() == 2 && windows.size() == 1);
+  EXPECT(cocclRegisterBufferForComm(
+             &first, &secondComm,
+             cocclBufferRegistrationKind::Ordinary) == ncclSuccess);
+  EXPECT(registrations.size() == 2);
   EXPECT(cocclGetBuffer(&firstComm, 1024, secondStream, &concurrent) ==
          ncclSuccess);
   EXPECT(first.ptr != concurrent.ptr);
@@ -186,6 +229,7 @@ int main() {
   EXPECT(cocclGetBuffer(&firstComm, 512, firstStream, &smaller) ==
          ncclSuccess);
   EXPECT(smaller.ptr == reusablePtr);
+  EXPECT(smaller.bytes == 1024);
   completeRecordedEvents = true;
   EXPECT(cocclReleaseBuffer(&crossStream, secondStream) == ncclSuccess);
   EXPECT(cocclReleaseBuffer(&smaller, firstStream) == ncclSuccess);
@@ -196,11 +240,12 @@ int main() {
          ncclSuccess);
   EXPECT(independent.ptr != reusablePtr);
   EXPECT(cocclReleaseBuffer(&independent, firstStream) == ncclSuccess);
-  const size_t allocationsBeforeFirstDestroy = allocations.size();
-  EXPECT(cocclBufferCommDestroy(&firstComm) == ncclSuccess);
-  EXPECT(allocations.size() < allocationsBeforeFirstDestroy);
-  EXPECT(!allocations.empty());
+  const size_t allocationsBeforeSecondDestroy = allocations.size();
   EXPECT(cocclBufferCommDestroy(&secondComm) == ncclSuccess);
+  EXPECT(allocations.size() < allocationsBeforeSecondDestroy);
+  EXPECT(!allocations.empty());
+  EXPECT(registrations.size() == 3 && windows.empty());
+  EXPECT(cocclBufferCommDestroy(&firstComm) == ncclSuccess);
   EXPECT(allocations.empty() && registrations.empty() && events.empty());
 
   EXPECT(cocclBufferCommInit(&firstComm) == ncclSuccess);
@@ -229,6 +274,38 @@ int main() {
   EXPECT(cocclReleaseBuffer(&afterError, firstStream) == ncclSuccess);
   EXPECT(cocclBufferCommDestroy(&firstComm) == ncclSuccess);
   EXPECT(allocations.empty() && registrations.empty() && events.empty());
+
+  firstComm.nNodes = 1;
+  EXPECT(cocclBufferCommInit(&firstComm) == ncclSuccess);
+  cocclBufferHandle symmetric;
+  EXPECT(cocclGetBufferForComm(
+             &firstComm, &firstComm, 4096,
+             cocclBufferRegistrationKind::Symmetric, firstStream,
+             &symmetric) == ncclSuccess);
+  EXPECT(windows.size() == 1);
+  EXPECT(cocclReleaseBuffer(&symmetric, firstStream) == ncclSuccess);
+  EXPECT(cocclBufferCommDestroy(&firstComm) == ncclSuccess);
+  EXPECT(windows.empty());
+
+  windowRegistrationEnabled = false;
+  EXPECT(cocclBufferCommInit(&firstComm) == ncclSuccess);
+  cocclBufferHandle fallback;
+  EXPECT(cocclGetBufferForComm(
+             &firstComm, &firstComm, 4096,
+             cocclBufferRegistrationKind::Symmetric, firstStream,
+             &fallback) == ncclSuccess);
+  void* fallbackPtr = fallback.ptr;
+  EXPECT(windows.empty() && registrations.size() == 1);
+  EXPECT(!cocclGetBufferRmaInfo(fallback, &firstComm, &rmaInfo));
+  EXPECT(cocclReleaseBuffer(&fallback, firstStream) == ncclSuccess);
+  EXPECT(cocclGetBufferForComm(
+             &firstComm, &firstComm, 4096,
+             cocclBufferRegistrationKind::Symmetric, firstStream,
+             &fallback) == ncclSuccess);
+  EXPECT(fallback.ptr == fallbackPtr && registrations.size() == 1);
+  EXPECT(cocclReleaseBuffer(&fallback, firstStream) == ncclSuccess);
+  EXPECT(cocclBufferCommDestroy(&firstComm) == ncclSuccess);
+  EXPECT(allocations.empty() && registrations.empty());
 
   std::puts("buffer manager tests passed");
   return 0;

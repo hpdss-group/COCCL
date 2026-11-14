@@ -48,7 +48,7 @@ on `Config` instead of creating parameter-transfer structs.
 
 ## Data Views
 
-- ABI v8 uses one `cocclCompressorView` for both directions. The SDK keeps
+- ABI v9 uses one `cocclCompressorView` for both directions. The SDK keeps
   `Input` read-only and `Output` writable; plugins should use these facades
   instead of accessing the ABI view directly.
 - `Input`: `data()`, `bytes()`, `elements()`, `chunks()`, `datatype()`, and
@@ -56,7 +56,8 @@ on `Config` instead of creating parameter-transfer structs.
 - `Output`: `data()`, `capacityBytes()`, planned shape accessors, commit
   methods, and raw `passthrough()` support.
 - `Context`: `stream()`, `rank()`, topology, typed config, `reduceChunks()`,
-  and lazy resources.
+  and lazy resources. Fused DRC reads the input codec with
+  `inputConfig<T>()` and the recompress codec with `config<T>()`.
 - Use `coccl::checkedAdd()` and `coccl::checkedMultiply()` for byte-layout
   arithmetic.
 
@@ -161,6 +162,19 @@ still carries the smaller runtime payload length.
 Call these inside the algorithm branch that needs them. A normal stateless
 compressor must not create a `State` merely to satisfy an interface.
 
+For history-based Compress/Decompress stages, declare `kPipelineState = true`.
+The runtime then supplies `pipelineSlice()`, `pipelineSlices()`, and
+`localChunkIndex()`. Use the actual slice index for history and the local
+chunk position for rank-indexed prediction; hierarchical decoder order may
+differ from user rank order. Scoped history belongs to the communicator and
+output layout, with each slot ordered after its preceding decoder write.
+Do not split history by local CUDA stream identity or require users to match
+a configured slot count to an automatically selected depth.
+
+This optional execution-context extension keeps ABI v9/Host API v3 prefixes.
+Plugins without PipelineState still receive the original execution structSize;
+PipelineState plugins require a runtime supplying the extended context.
+
 ## Error Contract
 
 - Reject unsupported datatypes and shapes before launching a kernel.
@@ -169,6 +183,9 @@ compressor must not create a `State` merely to satisfy an interface.
 - Check output capacity before writing.
 - Fused DRC must compare its exact recompress size with `capacityBytes()` before
   launching the kernel.
+- If a compressor implements fused DRC but cannot fuse a particular input and
+  output configuration pair, return `ncclInvalidUsage` before launching work;
+  Core will run the generic decode/reduce/encode path.
 - Check launch errors without adding a device synchronization.
 - Convert CUDA errors with `coccl::fromCuda()`.
 - Avoid exceptions across the plugin boundary.

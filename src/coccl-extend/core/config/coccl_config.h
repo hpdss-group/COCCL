@@ -22,6 +22,12 @@ enum class cocclDataParallelStrategy {
   Fsdp,
 };
 
+enum class cocclAllGatherAlgorithmPolicy {
+  Auto,
+  OneShot,
+  TwoShot,
+};
+
 enum class cocclReduceScatterAlgorithmPolicy {
   Auto,
   OneShot,
@@ -93,6 +99,7 @@ struct cocclPluginCatalog {
 
 struct cocclPipelineConfig {
   int depth = 1;
+  bool autoDepth = false;
 };
 
 struct cocclBufferConfig {
@@ -107,6 +114,8 @@ struct cocclAutotuneConfig {
   size_t profileMaxBytes = 8ULL * 1024 * 1024 * 1024;
   int warmup = 3;
   int iterations = 10;
+  cocclAllGatherAlgorithmPolicy allGatherAlgorithm =
+      cocclAllGatherAlgorithmPolicy::Auto;
   cocclReduceScatterAlgorithmPolicy reduceScatterAlgorithm =
       cocclReduceScatterAlgorithmPolicy::Auto;
   cocclAllReduceAlgorithmPolicy allReduceAlgorithm =
@@ -137,23 +146,6 @@ struct cocclConfig {
 constexpr int kCocclMinPipelineDepth = 1;
 constexpr int kCocclMaxPipelineDepth = 16;
 
-enum class cocclConfigPolicyId {
-  NormalAllGather,
-  NormalReduceScatter,
-  NormalAllReduce,
-  NormalAllToAll,
-  NormalSendRecv,
-  TrainingDpAllGather,
-  TrainingDpReduceScatter,
-  TrainingDpAllReduce,
-  TrainingTpAllGather,
-  TrainingTpReduceScatter,
-  TrainingTpAllReduce,
-  TrainingPpSendRecvForward,
-  TrainingPpSendRecvBackward,
-  Count,
-};
-
 enum class cocclPolicyScope {
   Normal,
   DataParallel,
@@ -161,11 +153,9 @@ enum class cocclPolicyScope {
   PipelineParallel,
 };
 
-constexpr size_t kCocclConfigPolicyCount =
-    static_cast<size_t>(cocclConfigPolicyId::Count);
+constexpr size_t kCocclConfigPolicyCount = 13;
 
 struct cocclConfigPolicyView {
-  cocclConfigPolicyId id;
   const char* path;
   cocclRuntimeMode mode;
   cocclPolicyScope scope;

@@ -20,6 +20,8 @@ int descriptorQueries = 0;
 int policyQueries = 0;
 int compressedCalls = 0;
 int nativeCalls = 0;
+int autotuneModelQueries = 0;
+uint64_t lastProfilerTag = 0;
 ncclResult_t resolverResult = ncclSuccess;
 cocclAlgorithmKind executedAlgorithm = cocclAlgorithmNone;
 std::array<void*, 3> scopeCompressors;
@@ -29,19 +31,16 @@ std::vector<cocclPreparedCall> grouped;
 
 constexpr cocclOperationDescriptor descriptors[] = {
     {cocclOperation::AllGather, "AllGather",
-     cocclOperationTraitScaleBytesByRanks | cocclOperationTraitGrouped},
+     cocclOperationTraitScaleBytesByRanks},
     {cocclOperation::ReduceScatter, "ReduceScatter",
-     cocclOperationTraitScaleBytesByRanks | cocclOperationTraitReduction |
-         cocclOperationTraitGrouped |
-         cocclOperationTraitHierarchicalPolicy},
+     cocclOperationTraitScaleBytesByRanks | cocclOperationTraitReduction},
     {cocclOperation::AllReduce, "AllReduce",
-     cocclOperationTraitReduction | cocclOperationTraitGrouped |
-         cocclOperationTraitCountDivisibleByRanks |
-         cocclOperationTraitHierarchicalPolicy},
+     cocclOperationTraitReduction |
+         cocclOperationTraitCountDivisibleByRanks},
     {cocclOperation::AllToAll, "AllToAll",
-     cocclOperationTraitScaleBytesByRanks | cocclOperationTraitGrouped},
+     cocclOperationTraitScaleBytesByRanks},
     {cocclOperation::SendRecv, "SendRecv",
-     cocclOperationTraitDirectionalPolicy | cocclOperationTraitGrouped},
+     cocclOperationTraitNone},
 };
 
 void fail(const char* expression, int line) {
@@ -60,6 +59,8 @@ void reset() {
   policyQueries = 0;
   compressedCalls = 0;
   nativeCalls = 0;
+  autotuneModelQueries = 0;
+  lastProfilerTag = 0;
   resolverResult = ncclSuccess;
   executedAlgorithm = cocclAlgorithmNone;
   scopeCompressors = {
@@ -150,7 +151,7 @@ bool cocclTrainingAssistEnabled() {
   return false;
 }
 
-void cocclTrainingAssistObserve(const cocclInfo*, int) {}
+void cocclTrainingAssistObserve(const cocclInfo*) {}
 
 bool cocclTrainingAssistQuery(
     ncclComm_t, cocclTrainingClassification*) {
@@ -169,13 +170,13 @@ const cocclOperationDescriptor* cocclGetOperationDescriptor(
       ? &descriptors[index] : nullptr;
 }
 
-bool cocclOperationSupportsPolicy(const cocclOperationDescriptor*,
-                                  cocclPolicyVariant) {
-  return true;
-}
-
 const cocclConfig& cocclGetConfig() {
   return config;
+}
+
+ncclResult_t cocclAutotuneEnsureGlobalModels(ncclComm_t) {
+  ++autotuneModelQueries;
+  return ncclSuccess;
 }
 
 ncclResult_t cocclSelectAlgorithm(cocclPreparedCall* prepared) {
@@ -212,6 +213,10 @@ ncclResult_t cocclGroupEnqueue(const cocclPreparedCall* prepared) {
   return ncclSuccess;
 }
 
+bool cocclGroupHasPending() {
+  return !grouped.empty();
+}
+
 ncclResult_t cocclGroupEnqueueNative(const cocclInfo* info) {
   cocclPreparedCall pending;
   pending.info = *info;
@@ -246,30 +251,36 @@ ncclResult_t cocclExecuteSendRecv(const cocclPreparedCall*) {
   return ncclSuccess;
 }
 
-ncclResult_t ncclAllGather(
-    const void*, void*, size_t, ncclDataType_t, ncclComm_t, cudaStream_t) {
+ncclResult_t ncclAllGatherConfig(
+    const void*, void*, size_t, ncclDataType_t, ncclComm_t, cudaStream_t,
+    const ncclCollConfig_t* config) {
   ++nativeCalls;
+  lastProfilerTag = config->userProfilerTag;
   return ncclSuccess;
 }
 
-ncclResult_t ncclReduceScatter(
+ncclResult_t ncclReduceScatterConfig(
     const void*, void*, size_t, ncclDataType_t, ncclRedOp_t, ncclComm_t,
-    cudaStream_t) {
+    cudaStream_t, const ncclCollConfig_t* config) {
   ++nativeCalls;
+  lastProfilerTag = config->userProfilerTag;
   return ncclSuccess;
 }
 
-ncclResult_t ncclAllReduce(
+ncclResult_t ncclAllReduceConfig(
     const void*, void*, size_t, ncclDataType_t, ncclRedOp_t, ncclComm_t,
-    cudaStream_t) {
+    cudaStream_t, const ncclCollConfig_t* config) {
   ++nativeCalls;
+  lastProfilerTag = config->userProfilerTag;
   return ncclSuccess;
 }
 
-ncclResult_t ncclAllToAll(
+ncclResult_t ncclAlltoAllConfig(
     const void* sendbuff, void* recvbuff, size_t count,
-    ncclDataType_t datatype, ncclComm_t comm, cudaStream_t stream) {
+    ncclDataType_t datatype, ncclComm_t comm, cudaStream_t stream,
+    const ncclCollConfig_t* config) {
   ++nativeCalls;
+  lastProfilerTag = config->userProfilerTag;
   cocclInfo nested;
   nested.sendbuff = sendbuff;
   nested.recvbuff = recvbuff;
@@ -314,7 +325,8 @@ int main() {
   enabled = false;
   info.operation = cocclOperation::Count;
   EXPECT(cocclEnqueueCheck(&info, &enqueued) == ncclSuccess);
-  EXPECT(!enqueued && descriptorQueries == 0 && policyQueries == 0);
+  EXPECT(!enqueued && descriptorQueries == 0 && policyQueries == 0 &&
+         autotuneModelQueries == 0);
 
   reset();
   info = allToAllInfo(&comm);
@@ -337,6 +349,19 @@ int main() {
   EXPECT(cocclEnqueueExplicitCall(&info, cocclAlgorithmNone) == ncclSuccess);
   EXPECT(policyQueries == 3 && nativeCalls == 1 && compressedCalls == 0);
 
+  // Explicit unsupported calls must not overtake earlier grouped messages.
+  for (bool p2p : {false, true}) {
+    reset();
+    info = p2p ? sendInfo(&comm, 1) : allToAllInfo(&comm);
+    info.datatype = ncclInt32;
+    ncclGroupDepth = 1;
+    EXPECT(cocclEnqueueExplicitCall(&info, cocclAlgorithmNone) == ncclSuccess);
+    ncclGroupDepth = 0;
+    EXPECT(nativeCalls == 0 && compressedCalls == 0 && grouped.size() == 1);
+    EXPECT(!grouped[0].compressors.anyEnabled());
+    EXPECT(grouped[0].info.operation == info.operation);
+  }
+
   reset();
   bytewiseLossless = true;
   info = allToAllInfo(&comm);
@@ -348,18 +373,47 @@ int main() {
   info = allToAllInfo(&comm);
   resolverResult = ncclInvalidUsage;
   EXPECT(cocclEnqueueCheck(&info, &enqueued) == ncclSuccess);
-  EXPECT(!enqueued && policyQueries == 3 && compressedCalls == 0);
+  EXPECT(!enqueued && policyQueries == 3 && compressedCalls == 0 &&
+         autotuneModelQueries == 0);
 
   reset();
   info = allToAllInfo(&comm);
   thresholdBytes = std::numeric_limits<size_t>::max();
   EXPECT(cocclEnqueueCheck(&info, &enqueued) == ncclSuccess);
-  EXPECT(!enqueued && policyQueries == 3 && compressedCalls == 0);
+  EXPECT(!enqueued && policyQueries == 3 && compressedCalls == 0 &&
+         autotuneModelQueries == 0);
 
   reset();
   info = allToAllInfo(&comm);
   EXPECT(cocclEnqueueCheck(&info, &enqueued) == ncclSuccess);
-  EXPECT(enqueued && policyQueries == 3 && compressedCalls == 1);
+  EXPECT(enqueued && policyQueries == 3 && compressedCalls == 1 &&
+         autotuneModelQueries == 1);
+
+  // A PP endpoint must not join collective profiling, even if another role's
+  // models are not ready in this process. Both API paths use local P2P tuning.
+  for (bool explicitCall : {false, true}) {
+    for (bool groupedCall : {false, true}) {
+      for (ncclFunc_t func : {ncclFuncSend, ncclFuncRecv}) {
+        reset();
+        info = sendInfo(&comm, 1);
+        info.func = func;
+        if (func == ncclFuncRecv) {
+          info.recvbuff = const_cast<void*>(info.sendbuff);
+          info.sendbuff = nullptr;
+        }
+        ncclGroupDepth = groupedCall ? 1 : 0;
+        if (explicitCall) {
+          EXPECT(cocclEnqueueExplicitCall(&info, cocclAlgorithmNone) ==
+                 ncclSuccess);
+        } else {
+          EXPECT(cocclEnqueueCheck(&info, &enqueued) == ncclSuccess && enqueued);
+        }
+        ncclGroupDepth = 0;
+        EXPECT(autotuneModelQueries == 0);
+        EXPECT(groupedCall ? grouped.size() == 1 : compressedCalls == 1);
+      }
+    }
+  }
 
   reset();
   enableOnly(cocclCompressionScope::Inter);
@@ -381,8 +435,10 @@ int main() {
 
   reset();
   info = allToAllInfo(&comm);
+  info.profilerTag = 0x1234;
   EXPECT(cocclReplayNativeCall(info) == ncclSuccess);
-  EXPECT(nativeCalls == 1 && policyQueries == 0 && compressedCalls == 0);
+  EXPECT(nativeCalls == 1 && policyQueries == 0 && compressedCalls == 0 &&
+         lastProfilerTag == 0x1234);
 
   reset();
   info = allToAllInfo(&comm);
@@ -399,6 +455,66 @@ int main() {
   ncclGroupDepth = 0;
   EXPECT(enqueued && grouped.size() == 1 &&
          !grouped[0].compressors.anyEnabled());
+
+  // Native collectives only queue when prior COCCL work requires ordering.
+  for (cocclOperation operation : {cocclOperation::AllGather,
+       cocclOperation::ReduceScatter, cocclOperation::AllReduce,
+       cocclOperation::AllToAll}) {
+    reset();
+    info = allToAllInfo(&comm);
+    info.operation = operation;
+    thresholdBytes = std::numeric_limits<size_t>::max();
+    ncclGroupDepth = 1;
+    EXPECT(cocclEnqueueCheck(&info, &enqueued) == ncclSuccess);
+    EXPECT(!enqueued && grouped.empty());
+    thresholdBytes = 0;
+    EXPECT(cocclEnqueueCheck(&info, &enqueued) == ncclSuccess && enqueued);
+    EXPECT(grouped.size() == 1 && grouped[0].compressors.anyEnabled());
+    thresholdBytes = std::numeric_limits<size_t>::max();
+    EXPECT(cocclEnqueueCheck(&info, &enqueued) == ncclSuccess && enqueued);
+    EXPECT(grouped.size() == 2 && !grouped[1].compressors.anyEnabled());
+    ncclGroupDepth = 0;
+  }
+
+  // Matching endpoints must not depend on the other calls in either group.
+  for (ncclDataType_t dtype : {ncclFloat32, ncclFloat16, ncclBfloat16}) {
+    for (int delta : {-16, 0, 16}) {
+      reset();
+      thresholdBytes = 4096;
+      send = sendInfo(&comm, 1);
+      send.datatype = dtype;
+      send.count = (4096 + delta) / ncclTypeSize(dtype);
+      cocclInfo recv = send;
+      recv.func = ncclFuncRecv;
+      recv.peer = 0;
+      recv.sendbuff = nullptr;
+      recv.recvbuff = reinterpret_cast<void*>(0x4000);
+      ncclGroupDepth = 1;
+      comm.rank = 0;
+      EXPECT(cocclEnqueueCheck(&send, &enqueued) == ncclSuccess && enqueued);
+      comm.rank = 1;
+      EXPECT(cocclEnqueueCheck(&recv, &enqueued) == ncclSuccess && enqueued);
+      ncclGroupDepth = 0;
+      comm.rank = 0;
+      EXPECT(grouped.size() == 2);
+      EXPECT(grouped[0].compressors.anyEnabled() == (delta > 0));
+      EXPECT(grouped[1].compressors.anyEnabled() == (delta > 0));
+      EXPECT(delta > 0 || autotuneModelQueries == 0);
+      EXPECT(compressedCalls == 0 && nativeCalls == 0);
+    }
+  }
+
+  reset();
+  thresholdBytes = 0;
+  send = sendInfo(&comm, 1);
+  send.count = 0;
+  ncclGroupDepth = 1;
+  EXPECT(cocclEnqueueCheck(&send, &enqueued) == ncclSuccess && enqueued);
+  send.count = 16;
+  EXPECT(cocclEnqueueCheck(&send, &enqueued) == ncclSuccess && enqueued);
+  ncclGroupDepth = 0;
+  EXPECT(grouped.size() == 2 && !grouped[0].compressors.anyEnabled() &&
+         grouped[1].compressors.anyEnabled());
 
   rankToNode[2] = 1;
   comm.nNodes = 2;
@@ -453,6 +569,18 @@ int main() {
   reset();
   comm.nNodes = 2;
   comm.localRanks = 2;
+  reduction = allToAllInfo(&comm);
+  reduction.operation = cocclOperation::ReduceScatter;
+  reduction.op = ncclSum;
+  ncclGroupDepth = 1;
+  EXPECT(cocclEnqueueCheck(&reduction, &enqueued) == ncclSuccess);
+  ncclGroupDepth = 0;
+  EXPECT(enqueued && grouped.size() == 1 &&
+         grouped[0].algorithm == cocclAlgorithmNone);
+  EXPECT(cocclExecutePreparedCall(&grouped[0]) == ncclSuccess);
+  EXPECT(executedAlgorithm == cocclAlgorithmReduceScatterTwoShot);
+
+  reset();
   reduction = allToAllInfo(&comm);
   reduction.operation = cocclOperation::ReduceScatter;
   reduction.op = ncclSum;

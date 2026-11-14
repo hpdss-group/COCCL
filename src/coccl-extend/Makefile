@@ -9,8 +9,10 @@ COCCL_INCLUDE_DIR = $(COCCL_ROOT)/include
 COCCL_INCFLAGS = -I$(COCCL_INCLUDE_DIR) -I$(COCCL_ROOT)
 
 COCCL_CORE_HOST_SRCFILES = \
+	$(wildcard $(COCCL_ROOT)/core/backend/*.cc) \
 	$(wildcard $(COCCL_ROOT)/core/runtime/*.cc) \
 	$(wildcard $(COCCL_ROOT)/core/pipeline/*.cc) \
+	$(wildcard $(COCCL_ROOT)/core/communication/*.cc) \
 	$(wildcard $(COCCL_ROOT)/core/compression/*.cc) \
 	$(wildcard $(COCCL_ROOT)/core/memory/*.cc) \
 	$(wildcard $(COCCL_ROOT)/core/config/*.cc) \
@@ -48,6 +50,7 @@ $(COCCL_OBJDIR)/%.cu.o: $(COCCL_ROOT)/%.cu
 	mkdir -p $(dir $@)
 	$(NVCC) $(NVCUFLAGS) -Xcompiler -fPIC \
 		-I$(INCDIR) -I$(NCCLDIR)/src -I$(NCCLDIR)/src/include \
+		-I$(NCCLDIR)/src/include/plugin \
 		$(COCCL_INCFLAGS) -MMD -MF $@.d -c $< -o $@
 endif
 

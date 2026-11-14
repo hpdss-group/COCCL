@@ -1,3 +1,41 @@
+/*
+ * Copyright (c) 2004, 2005 Topspin Communications.  All rights reserved.
+ * Copyright (c) 2004, 2011-2012 Intel Corporation.  All rights reserved.
+ * Copyright (c) 2005, 2006, 2007 Cisco Systems, Inc.  All rights reserved.
+ * Copyright (c) 2005 PathScale, Inc.  All rights reserved.
+ *
+ * This software is available to you under the OpenIB.org BSD license below:
+ *
+ *     Redistribution and use in source and binary forms, with or
+ *     without modification, are permitted provided that the following
+ *     conditions are met:
+ *
+ *      - Redistributions of source code must retain the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer.
+ *
+ *      - Redistributions in binary form must reproduce the above
+ *        copyright notice, this list of conditions and the following
+ *        disclaimer in the documentation and/or other materials
+ *        provided with the distribution.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
+/*************************************************************************
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0 and BSD-3
+ *
+ * See LICENSE.txt for more license information
+ *************************************************************************/
+
 #ifndef NCCL_IBV_CORE_H_
 #define NCCL_IBV_CORE_H_
 
@@ -9,6 +47,7 @@
 #include <stdint.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <string.h>
 
 #if __GNUC__ >= 3
 #  define __attribute_const __attribute__((const))
@@ -39,7 +78,7 @@ union ibv_gid {
 #define vext_field_avail(type, fld, sz) (offsetof(type, fld) < (sz))
 
 /*XXX:__VERBS_ABI_IS_EXTENDED produces warning "integer operation result is out of range" with g++ 4.8.2*/
-//static void *__VERBS_ABI_IS_EXTENDED = ((uint8_t *)NULL) - 1;
+static void *__VERBS_ABI_IS_EXTENDED = ((uint8_t *)NULL) - 1;
 
 enum ibv_node_type {
 	IBV_NODE_UNKNOWN	= -1,
@@ -187,6 +226,10 @@ enum ibv_port_cap_flags {
 	IBV_PORT_IP_BASED_GIDS			= 1 << 26,
 };
 
+enum ibv_query_port_flags {
+	IBV_QPF_GRH_REQUIRED = 1 << 0,
+};
+
 struct ibv_port_attr {
 	enum ibv_port_state	state;
 	enum ibv_mtu		max_mtu;
@@ -208,7 +251,9 @@ struct ibv_port_attr {
 	uint8_t			active_speed;
 	uint8_t			phys_state;
 	uint8_t			link_layer;
-	uint8_t			reserved;
+	uint8_t                 flags;
+	uint16_t                port_cap_flags2;
+	uint32_t                active_speed_ex;
 };
 
 enum ibv_event_type {
@@ -231,6 +276,8 @@ enum ibv_event_type {
 	IBV_EVENT_QP_LAST_WQE_REACHED,
 	IBV_EVENT_CLIENT_REREGISTER,
 	IBV_EVENT_GID_CHANGE,
+	IBV_EVENT_WQ_FATAL,
+	IBV_EVENT_DEVICE_SPEED_CHANGE,
 
 	/* new experimental events start here leaving enough
 	 * room for 14 events which should be enough
@@ -993,37 +1040,50 @@ enum verbs_context_mask {
 
 struct verbs_context {
 	/*  "grows up" - new fields go here */
-	int (*_reserved_2) (void);
-	int (*destroy_flow) (struct ibv_flow *flow);
-	int (*_reserved_1) (void);
-	struct ibv_flow * (*create_flow) (struct ibv_qp *qp,
-					  struct ibv_flow_attr *flow_attr);
+	int (*query_port)(struct ibv_context *context, uint8_t port_num,
+			  struct ibv_port_attr *port_attr,
+			  size_t port_attr_len);
+	int (*_reserved[25]) (void);
+	struct verbs_ex_private *priv;
+	int (*query_device_ex)(struct ibv_context *context,
+			       const struct ibv_query_device_ex_input *input,
+			       struct ibv_device_attr_ex *attr,
+			       size_t attr_size);
+	int (*ibv_destroy_flow) (struct ibv_flow *flow);
+	void (*ABI_placeholder2) (void); /* DO NOT COPY THIS GARBAGE */
+	struct ibv_flow * (*ibv_create_flow) (struct ibv_qp *qp,
+					      struct ibv_flow_attr *flow_attr);
+	void (*ABI_placeholder1) (void); /* DO NOT COPY THIS GARBAGE */
 	struct ibv_qp * (*open_qp)(struct ibv_context *context,
 			struct ibv_qp_open_attr *attr);
 	struct ibv_qp * (*create_qp_ex)(struct ibv_context *context,
 			struct ibv_qp_init_attr_ex *qp_init_attr_ex);
 	int (*get_srq_num)(struct ibv_srq *srq, uint32_t *srq_num);
-	struct ibv_srq * (*create_srq_ex)(struct ibv_context *context,
-			struct ibv_srq_init_attr_ex *srq_init_attr_ex);
-	struct ibv_xrcd * (*open_xrcd)(struct ibv_context *context,
-			struct ibv_xrcd_init_attr *xrcd_init_attr);
-	int  (*close_xrcd)(struct ibv_xrcd *xrcd);
-	uint64_t has_comp_mask;
-	size_t   sz;	/* Must be immediately before struct ibv_context */
-	struct ibv_context context;/* Must be last field in the struct */
+	struct ibv_srq *	(*create_srq_ex)(struct ibv_context *context,
+						 struct ibv_srq_init_attr_ex *srq_init_attr_ex);
+	struct ibv_xrcd *	(*open_xrcd)(struct ibv_context *context,
+					     struct ibv_xrcd_init_attr *xrcd_init_attr);
+	int			(*close_xrcd)(struct ibv_xrcd *xrcd);
+	uint64_t _ABI_placeholder3;
+	size_t   sz;			/* Must be immediately before struct ibv_context */
+	struct ibv_context context;	/* Must be last field in the struct */
 };
 
-/*XXX:__VERBS_ABI_IS_EXTENDED produces warning "integer operation result is out of range" with g++ 4.8.2*/
-/*static inline struct verbs_context *verbs_get_ctx(struct ibv_context *ctx)
+static inline struct verbs_context *verbs_get_ctx(struct ibv_context *ctx)
 {
-	return (!ctx || (ctx->abi_compat != __VERBS_ABI_IS_EXTENDED)) ?
-		NULL : container_of(ctx, struct verbs_context, context);
+	if (ctx->abi_compat != __VERBS_ABI_IS_EXTENDED)
+		return NULL;
+
+	/* open code container_of to not pollute the global namespace */
+	return (struct verbs_context *)(((uintptr_t)ctx) -
+					offsetof(struct verbs_context,
+						 context));
 }
 
 #define verbs_get_ctx_op(ctx, op) ({ \
-	struct verbs_context *_vctx = verbs_get_ctx(ctx); \
-	(!_vctx || (_vctx->sz < sizeof(*_vctx) - offsetof(struct verbs_context, op)) || \
-	!_vctx->op) ? NULL : _vctx; })*/
+	struct verbs_context *__vctx = verbs_get_ctx(ctx); \
+	(!__vctx || (__vctx->sz < sizeof(*__vctx) - offsetof(struct verbs_context, op)) || \
+	 !__vctx->op) ? NULL : __vctx; })
 
 #define verbs_set_ctx_op(_vctx, op, ptr) ({ \
 	struct verbs_context *vctx = _vctx; \
@@ -1054,5 +1114,21 @@ struct ibv_ece {
 	uint32_t options;
 	uint32_t comp_mask;
 };
+
+/**
+ * ibv_query_port_ex - Get (extended) port properties
+ */
+static inline int ibv_query_port_ex(struct ibv_context *context,
+				    uint8_t port_num,
+				    struct ibv_port_attr *port_attr)
+{
+	struct verbs_context *vctx = verbs_get_ctx_op(context, query_port);
+
+        if (vctx) {
+          return vctx->query_port(context, port_num, port_attr, sizeof(*port_attr));
+        }
+
+        return -1;
+}
 
 #endif  // NCCL_IBV_CORE_H_

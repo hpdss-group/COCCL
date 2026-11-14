@@ -10,9 +10,20 @@
 struct cocclBufferHandle {
   void* ptr = nullptr;
   size_t bytes = 0;
-  ncclComm_t ownerComm = nullptr;
   void* block = nullptr;
   void* slice = nullptr;
+};
+
+struct cocclBufferRmaInfo {
+  ncclWindow_t window = nullptr;
+  size_t bufferOffset = 0;
+  bool singleSegment = false;
+};
+
+enum class cocclBufferRegistrationKind {
+  Ordinary,
+  Symmetric,
+  Rma,
 };
 
 ncclResult_t cocclBufferCommInit(ncclComm_t comm);
@@ -23,13 +34,18 @@ ncclResult_t cocclGetBuffer(ncclComm_t comm, size_t bytes,
                             cocclBufferHandle* buffer);
 ncclResult_t cocclGetBufferForComm(ncclComm_t ownerComm,
                                    ncclComm_t registeredComm, size_t bytes,
+                                   cocclBufferRegistrationKind registration,
                                    cudaStream_t stream,
                                    cocclBufferHandle* buffer);
 ncclResult_t cocclGetUnregisteredBuffer(ncclComm_t ownerComm, size_t bytes,
                                         cudaStream_t stream,
                                         cocclBufferHandle* buffer);
 ncclResult_t cocclRegisterBufferForComm(cocclBufferHandle* buffer,
-                                        ncclComm_t registeredComm);
+                                        ncclComm_t registeredComm,
+                                        cocclBufferRegistrationKind registration);
+bool cocclGetBufferRmaInfo(const cocclBufferHandle& buffer,
+                           ncclComm_t registeredComm,
+                           cocclBufferRmaInfo* info);
 ncclResult_t cocclReleaseBuffer(cocclBufferHandle* buffer,
                                 cudaStream_t stream);
 

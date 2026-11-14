@@ -3,9 +3,11 @@
 
 #include "core/memory/coccl_buffer_management.h"
 
+#include "checks.h"
 #include "comm.h"
 
 #include <cuda.h>
+#include <iterator>
 #include <list>
 #include <map>
 #include <memory>
@@ -36,19 +38,85 @@ inline size_t alignUp(size_t value) {
       kBufferAlignment;
 }
 
-struct LegacyBlock;
-
-struct LegacySlice {
+struct BufferSlice {
   size_t offset = 0;
   size_t bytes = 0;
   SliceState state = SliceState::Free;
   cudaEvent_t doneEvent = nullptr;
   cudaStream_t pendingStream = nullptr;
-  LegacyBlock* block = nullptr;
 };
 
-struct LegacyRegistration {
+inline bool reusable(BufferSlice* slice) {
+  if (slice->state == SliceState::Free) return true;
+  if (slice->state != SliceState::Pending) return false;
+
+  const cudaError_t status = cudaEventQuery(slice->doneEvent);
+  if (status == cudaSuccess) {
+    slice->state = SliceState::Free;
+    slice->pendingStream = nullptr;
+    return true;
+  }
+  return false;
+}
+
+inline bool reusableOnStream(BufferSlice* slice, cudaStream_t stream,
+                              bool allowPendingReuse) {
+  if (allowPendingReuse && slice->state == SliceState::Pending &&
+      slice->pendingStream == stream) {
+    return true;
+  }
+  return reusable(slice);
+}
+
+inline void mergeFreeSlices(std::list<BufferSlice>& slices) {
+  for (auto current = slices.begin(); current != slices.end();) {
+    auto next = std::next(current);
+    if (next == slices.end()) break;
+    if (reusable(&*current) && reusable(&*next) &&
+        current->offset + current->bytes == next->offset) {
+      current->bytes += next->bytes;
+      if (next->doneEvent != nullptr) {
+        CUDACHECKIGNORE(cudaEventDestroy(next->doneEvent));
+      }
+      slices.erase(next);
+    } else {
+      ++current;
+    }
+  }
+}
+
+// Same-stream pending reuse keeps the full slice until its event completes.
+inline void splitFreeSlice(std::list<BufferSlice>& slices,
+                            std::list<BufferSlice>::iterator slice,
+                            size_t bytes) {
+  if (slice->bytes > bytes && slice->state != SliceState::Pending) {
+    BufferSlice remainder;
+    remainder.offset = slice->offset + bytes;
+    remainder.bytes = slice->bytes - bytes;
+    slice->bytes = bytes;
+    slices.insert(std::next(slice), remainder);
+  }
+}
+
+inline ncclResult_t releaseSlice(BufferSlice* slice, cudaStream_t stream) {
+  if (slice->doneEvent == nullptr) {
+    CUDACHECK(cudaEventCreateWithFlags(&slice->doneEvent,
+                                       cudaEventDisableTiming));
+  }
+  CUDACHECK(cudaEventRecord(slice->doneEvent, stream));
+  slice->state = SliceState::Pending;
+  slice->pendingStream = stream;
+  return ncclSuccess;
+}
+
+struct BufferRegistration {
+  ncclComm_t comm = nullptr;
+  void* ptr = nullptr;
+  size_t bytes = 0;
   void* handle = nullptr;
+  ncclWindow_t window = nullptr;
+  cocclBufferRegistrationKind kind =
+      cocclBufferRegistrationKind::Ordinary;
 };
 
 struct LegacyBlock : BufferBlock {
@@ -56,28 +124,15 @@ struct LegacyBlock : BufferBlock {
   int cudaDev = -1;
   void* ptr = nullptr;
   size_t capacity = 0;
-  std::list<LegacySlice> slices;
-  std::map<ncclComm_t, LegacyRegistration> registrations;
+  std::list<BufferSlice> slices;
+  std::map<ncclComm_t, BufferRegistration> registrations;
 };
 
 #if CUDART_VERSION >= 11030
 
-struct VmmBlock;
-
-struct VmmSlice {
-  size_t offset = 0;
+struct VmmSegment {
+  CUmemGenericAllocationHandle handle = 0;
   size_t bytes = 0;
-  SliceState state = SliceState::Free;
-  cudaEvent_t doneEvent = nullptr;
-  cudaStream_t pendingStream = nullptr;
-  VmmBlock* block = nullptr;
-};
-
-struct VmmRegistration {
-  ncclComm_t comm = nullptr;
-  void* ptr = nullptr;
-  size_t bytes = 0;
-  void* handle = nullptr;
 };
 
 struct VmmBlock : BufferBlock {
@@ -86,9 +141,9 @@ struct VmmBlock : BufferBlock {
   int cudaDev = -1;
   void* ptr = nullptr;
   size_t capacity = 0;
-  std::vector<CUmemGenericAllocationHandle> handles;
-  std::list<VmmSlice> slices;
-  std::vector<VmmRegistration> registrations;
+  std::vector<VmmSegment> segments;
+  std::list<BufferSlice> slices;
+  std::vector<BufferRegistration> registrations;
 };
 
 struct VmmPool {
@@ -117,11 +172,23 @@ struct CommBufferPool {
 #endif
 };
 
+ncclResult_t registerBuffer(ncclComm_t comm, void* ptr, size_t bytes,
+                            cocclBufferRegistrationKind requested,
+                            BufferRegistration* registration);
+ncclResult_t upgradeRegistration(
+    BufferRegistration* registration,
+    cocclBufferRegistrationKind requested);
+ncclResult_t deregisterBuffer(BufferRegistration* registration);
+bool registrationSatisfies(const BufferRegistration& registration,
+                           cocclBufferRegistrationKind requested);
+
 ncclResult_t legacyAcquire(CommBufferPool* pool, ncclComm_t registeredComm,
+                           cocclBufferRegistrationKind registration,
                            size_t bytes, cudaStream_t stream,
                            cocclBufferHandle* buffer);
 ncclResult_t legacyRegister(cocclBufferHandle* buffer,
-                            ncclComm_t registeredComm);
+                            ncclComm_t registeredComm,
+                            cocclBufferRegistrationKind registration);
 ncclResult_t legacyRelease(cocclBufferHandle* buffer, cudaStream_t stream);
 ncclResult_t legacyDeregisterComm(CommBufferPool* pool, ncclComm_t comm);
 ncclResult_t legacyDestroy(CommBufferPool* pool);
@@ -131,10 +198,12 @@ ncclResult_t legacyDestroy(CommBufferPool* pool);
 ncclResult_t vmmInit(VmmPool* pool, ncclComm_t ownerComm,
                      bool* available);
 ncclResult_t vmmAcquire(VmmPool* pool, ncclComm_t registeredComm,
+                        cocclBufferRegistrationKind registration,
                         size_t bytes, cudaStream_t stream,
                         cocclBufferHandle* buffer);
 ncclResult_t vmmRegister(cocclBufferHandle* buffer,
-                         ncclComm_t registeredComm);
+                         ncclComm_t registeredComm,
+                         cocclBufferRegistrationKind registration);
 ncclResult_t vmmRelease(cocclBufferHandle* buffer, cudaStream_t stream);
 ncclResult_t vmmDeregisterComm(VmmPool* pool, ncclComm_t comm);
 ncclResult_t vmmDestroy(VmmPool* pool);

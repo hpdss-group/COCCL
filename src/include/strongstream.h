@@ -1,8 +1,9 @@
 /*************************************************************************
- * Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * See LICENSE.txt for license information
- ************************************************************************/
+ * See LICENSE.txt for more license information
+ *************************************************************************/
 
 #ifndef NCCL_STRONGSTREAM_H_
 #define NCCL_STRONGSTREAM_H_
@@ -10,44 +11,59 @@
 #include "nccl.h"
 #include "checks.h"
 
+#include <cuda.h>
+#include <cuda_runtime.h>
 #include <stdint.h>
+#include <mutex>
+
+// ncclCudaContext: wraps a CUDA context with per-context state.
+struct ncclCudaContext;
+
+// Get a ncclCudaContext to track the currently active CUDA context.
+ncclResult_t ncclCudaContextTrack(struct ncclCudaContext** out, int launchOrderImplicit, uint64_t commHash);
+// Drop reference.
+void ncclCudaContextDrop(struct ncclCudaContext* cxt);
 
 /* ncclCudaGraph: Wraps a cudaGraph_t so that we can support pre-graph CUDA runtimes
  * easily.
  */
 struct ncclCudaGraph {
 #if CUDART_VERSION >= 11030
+  cudaStream_t origin;
   cudaGraph_t graph;
   unsigned long long graphId;
+  int graphUsageMode;
 #endif
 };
 
-inline struct ncclCudaGraph ncclCudaGraphNone() {
+inline struct ncclCudaGraph ncclCudaGraphNone(int graphUsageMode) {
   struct ncclCudaGraph tmp;
-  #if CUDART_VERSION >= 11030
-    tmp.graph = nullptr;
-    tmp.graphId = ULLONG_MAX;
-  #endif
+#if CUDART_VERSION >= 11030
+  tmp.origin = nullptr;
+  tmp.graph = nullptr;
+  tmp.graphId = ULLONG_MAX;
+  tmp.graphUsageMode = graphUsageMode;
+#endif
   return tmp;
 }
 
 inline bool ncclCudaGraphValid(struct ncclCudaGraph graph) {
-  #if CUDART_VERSION >= 11030
-    return graph.graph != nullptr;
-  #else
-    return false;
-  #endif
+#if CUDART_VERSION >= 11030
+  return graph.graphId != ULLONG_MAX;
+#else
+  return false;
+#endif
 }
 
 inline bool ncclCudaGraphSame(struct ncclCudaGraph a, struct ncclCudaGraph b) {
-  #if CUDART_VERSION >= 11030
-    return a.graphId == b.graphId;
-  #else
-    return true;
-  #endif
+#if CUDART_VERSION >= 11030
+  return a.graphId == b.graphId;
+#else
+  return true;
+#endif
 }
 
-ncclResult_t ncclCudaGetCapturingGraph(struct ncclCudaGraph* graph, cudaStream_t stream);
+ncclResult_t ncclCudaGetCapturingGraph(struct ncclCudaGraph* graph, cudaStream_t stream, int graphUsageMode);
 ncclResult_t ncclCudaGraphAddDestructor(struct ncclCudaGraph graph, cudaHostFn_t fn, void* arg);
 
 /* ncclStrongStream: An abstraction over CUDA streams that do not lose their
@@ -57,84 +73,68 @@ ncclResult_t ncclCudaGraphAddDestructor(struct ncclCudaGraph graph, cudaHostFn_t
  * streams unfit for the use of serializing access to a persistent resource.
  * Strong streams have been introduced to address this need.
  *
- * - All updates to a strong stream must be enclosed by a Acquire/Release pair.
+ * All updates to a strong stream must be enclosed by a Acquire/Release pair.
  *
- * - The Acquire, Release, and all updates take a ncclCudaGraph parameter
- *   indicating the currently capturing graph (or none). This parameter must be
- *   the same for the entire sequence of {Acquire; ...; Release}.
+ * Acquire retrieves a "work" stream (cudaStream_t) which may be used to add
+ * work.
  *
- * - An {Acquire; ...; Release} sequence must not be concurrent with any
- *   other operations against the strong stream including graph launches which
- *   reference this stream.
+ * Release publishes the work streams work into the strong stream. The Release
+ * must be issued by the same thread that did the Acquire.
  */
 struct ncclStrongStream;
 
 ncclResult_t ncclStrongStreamConstruct(struct ncclStrongStream* ss);
 ncclResult_t ncclStrongStreamDestruct(struct ncclStrongStream* ss);
 
-// Acquire-fence the strong stream.
-ncclResult_t ncclStrongStreamAcquire(
-  struct ncclCudaGraph graph, struct ncclStrongStream* ss
-);
+// Acquire the strong stream. Upon return `*workStream` will be usable to add work.
+// `concurrent` indicates if other threads may be using the strong stream.
+ncclResult_t ncclStrongStreamAcquire(struct ncclCudaGraph graph, struct ncclStrongStream* ss, bool concurrent,
+                                     cudaStream_t* workStream);
 
-// Acquire-fence the strong stream assuming no graph is capturing. This permits
-// the caller to enqueue directly to the `ss->cudaStream` member using native CUDA
-// calls. Strong stream still must be released via:
-//   ncclStrongStreamRelease(ncclCudaGraphNone(), ss);
-ncclResult_t ncclStrongStreamAcquireUncaptured(struct ncclStrongStream* ss);
+// Get the workStream for an already acquired strong stream.
+// `concurrent` indicates if other threads may be using the strong stream.
+ncclResult_t ncclStrongStreamAcquiredWorkStream(struct ncclCudaGraph graph, struct ncclStrongStream* ss,
+                                                bool concurrent, cudaStream_t* workStream);
 
-// Release-fence of the strong stream.
-ncclResult_t ncclStrongStreamRelease(struct ncclCudaGraph graph, struct ncclStrongStream* ss);
+// Release of the strong stream.
+// `concurrent` indicates if other threads may be using the strong stream.
+ncclResult_t ncclStrongStreamRelease(struct ncclCudaGraph graph, struct ncclStrongStream* ss, bool concurrent);
+ncclResult_t ncclCudaGraphRecordEvent(struct ncclCudaGraph graph, cudaEvent_t event, cudaStream_t stream);
 
-// Add a host launch to the stream.
-ncclResult_t ncclStrongStreamLaunchHost(
-  struct ncclCudaGraph graph, struct ncclStrongStream* ss,
-  cudaHostFn_t fn, void* arg
-);
-// Add a kernel launch to the stream.
-ncclResult_t ncclStrongStreamLaunchKernel(
-  struct ncclCudaGraph graph, struct ncclStrongStream* ss,
-  void* fn, dim3 grid, dim3 block, void** args, size_t sharedMemBytes
-);
+ncclResult_t ncclStreamWaitStream(cudaStream_t a, cudaStream_t b, cudaEvent_t scratchEvent);
 
-// Cause `a` to wait for the current state `b`. Both `a` and `b` must be acquired.
-// `b_subsumes_a` indicates that all work in `a` is already present in `b`, thus
-// we want to fast-forward `a` to be a clone of `b`. Knowing this permits the
-// implementation to induce few graph dependencies.
-ncclResult_t ncclStrongStreamWaitStream(
-  struct ncclCudaGraph graph, struct ncclStrongStream* a, struct ncclStrongStream* b, bool b_subsumes_a=false
-);
-// `b` must be capturing within `graph`.
-ncclResult_t ncclStrongStreamWaitStream(
-  struct ncclCudaGraph graph, struct ncclStrongStream* a, cudaStream_t b, bool b_subsumes_a=false
-);
-// `a` must be capturing within `graph`.
-ncclResult_t ncclStrongStreamWaitStream(
-  struct ncclCudaGraph graph, cudaStream_t a, struct ncclStrongStream* b, bool b_subsumes_a=false
-);
+// Like cudaStreamWaitEvent except `e` must be strictly ahead of everything in `s`.
+ncclResult_t ncclStreamAdvanceToEvent(struct ncclCudaGraph g, cudaStream_t s, cudaEvent_t e);
 
 // Synchrnoization does not need the strong stream to be acquired.
 ncclResult_t ncclStrongStreamSynchronize(struct ncclStrongStream* ss);
 
 ////////////////////////////////////////////////////////////////////////////////
 
-struct ncclStrongStreamGraph; // internal to ncclStrongStream
+struct ncclStrongStreamCapture; // internal to ncclStrongStream
 
 struct ncclStrongStream {
-  // Used when not graph capturing.
-  cudaStream_t cudaStream;
+  // The stream to use for non-captured work.
+  cudaStream_t liveStream;
+  void* liveAcquiredBy;
 #if CUDART_VERSION >= 11030
+  // This stream ever appeared in a graph capture.
+  bool everCaptured;
+  std::mutex mutex;
+  struct ncclStrongStreamCapture* captureHead;
   // The event used to establish order between graphs and streams. During acquire
   // this event is waited on, during release it is recorded to.
   cudaEvent_t serialEvent;
-  // This stream ever appeared in a graph capture.
-  bool everCaptured;
-  // Tracks whether serialEvent needs to be recorded to upon Release().
-  bool serialEventNeedsRecord;
-  struct ncclStrongStreamGraph* graphHead;
-#else
-  cudaEvent_t scratchEvent;
 #endif
+};
+
+struct ncclCudaContext {
+  struct ncclCudaContext* next;
+  CUcontext hcontext;
+  int refCount;
+  bool launchOrderImplicitEverEnabled;
+  bool launchOrderImplicitEverDisabled;
+  struct ncclStrongStream launchOrder;
 };
 
 #endif

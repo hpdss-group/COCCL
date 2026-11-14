@@ -3,15 +3,17 @@
 
 #include <stdint.h>
 
-#include "core/pipeline/coccl_frame_exchange.h"
+#include "core/communication/coccl_frame_exchange.h"
+#include "core/compression/coccl_compressor_runtime.h"
 #include "core/pipeline/coccl_pipeline.h"
 
-constexpr int kCocclPipelineExplicitStages = 7;
-constexpr int kCocclPipelinePhysicalStages = 9;
-constexpr int kCocclPipelineStageKindCount = 9;
-constexpr int kCocclPipelineMaxTemps = 8;
+constexpr int kCocclPipelineExplicitStages = 8;
+constexpr int kCocclPipelinePhysicalStages = 10;
+constexpr int kCocclPipelineStageKindCount = 10;
+constexpr int kCocclPipelineMaxTemps = 9;
 constexpr int kCocclPipelineMaxDepth = 16;
 constexpr int kCocclPipelineRawRingSlots = 2;
+constexpr size_t kCocclPipelineSliceAlignment = 16;
 constexpr size_t kCocclPipelineAlignment = 256;
 
 struct cocclPipelineEdge {
@@ -36,8 +38,17 @@ struct cocclPipelineFrameResources {
   cocclCompressorFrameMetadata* sendMetadata;
   cocclCompressorFrameMetadata* recvMetadata;
   cocclFrameExchange* exchanges;
+  ncclWaitSignalDesc_t* waitDescriptors;
   size_t metadataCapacity;
   size_t exchangeCapacity;
+  size_t waitCapacity;
+};
+
+struct cocclPipelineRmaWindow {
+  ncclComm_t comm;
+  ncclWindow_t window;
+  size_t workspaceOffset;
+  bool singleSegment;
 };
 
 struct cocclPipelineStageContext {
@@ -48,8 +59,14 @@ struct cocclPipelineStageContext {
   ncclComm_t ownerComm;
   cocclPipelineFrameResources* frameResources;
   cocclPipelineInputLayout inputLayout;
+  cocclPipelineOutputLayout outputLayout;
   int nNodes;
   int ranksPerNode;
+  uint64_t profilerTag;
+  void* registeredBase;
+  cocclPipelineRmaWindow rmaWindows[kCocclPipelineExplicitStages];
+  int rmaWindowCount;
+  cocclCompressorScope compressorScope;
 };
 
 enum cocclPipelineTempRole {
@@ -60,6 +77,7 @@ enum cocclPipelineTempRole {
   cocclPipelineTempDecompReduceCompOutput,
   cocclPipelineTempDecompressReduceOutput,
   cocclPipelineTempReduceScatterOutput,
+  cocclPipelineTempSendRecvOutput,
   cocclPipelineTempOutputStaging,
 };
 
@@ -148,6 +166,9 @@ inline bool cocclAlignPipelineBytes(size_t bytes, size_t* aligned) {
 ncclResult_t cocclPreparePipeline(const cocclPipelineSpec* spec,
                                   int requestedDepth,
                                   cocclPipelineContext* context);
+ncclResult_t cocclPreparePipelineForSlice(
+    const cocclPipelineSpec* spec, size_t targetSliceBytes, int maxDepth,
+    cocclPipelineContext* context);
 ncclResult_t cocclPipelineUserBuffersRequireSerial(
     const void* input, size_t inputChunks, void* output, size_t outputChunks,
     size_t rawChunkBytes, int rank,
@@ -156,6 +177,8 @@ ncclResult_t cocclPlanPipelineWorkspace(cocclPipelinePlan* plan, int depth);
 ncclResult_t cocclPipelineStageOutputChunks(
     const cocclPipelineStage& stage, size_t inputChunks,
     size_t* outputChunks);
+int cocclPipelineStageCtaPolicy(
+    ncclComm_t ownerComm, const cocclPipelineStage& stage);
 ncclResult_t cocclExecutePipelineStage(
     const cocclPipelineStageContext* context,
     const cocclPipelineStage* stage, cocclPipelineEdge* edge,
@@ -170,5 +193,9 @@ ncclResult_t cocclCommitPipelineFrameExchange(
     const cocclPipelineStageContext* context,
     const cocclPipelineStage* stage, cocclPipelineEdge* edge,
     const cocclPipelineStageOutput* output, cudaStream_t stream);
+void cocclPipelineApplyReceivedFrame(
+    const cocclPipelineStage& stage,
+    const cocclCompressorFrameMetadata& metadata,
+    cocclPipelineEdge* edge, const cocclPipelineStageOutput& output);
 
 #endif

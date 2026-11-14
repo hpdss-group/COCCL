@@ -3,7 +3,9 @@
 #include <cuda_runtime.h>
 #include <mpi.h>
 #include <nccl.h>
+#include "runtime/coccl_runtime.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -14,12 +16,13 @@
 
 namespace {
 
-constexpr size_t kElementsPerRank = 4096;
+constexpr size_t kRawChunkElements = 2048;
 int gWorldRank = 0;
 
 enum class Operation {
   AllToAll,
   AllGather,
+  AllGatherTwoShot,
   ReduceScatterOneShot,
   ReduceScatterTwoShot,
   AllReduceOneShot,
@@ -35,8 +38,12 @@ struct Options {
   std::string topology;
   std::string operation;
   std::string algorithm;
+  std::string path = "explicit";
   int depth = 1;
-  size_t rawChunkElements = 0;
+  bool inPlace = false;
+  bool alternateStream = false;
+  size_t rawChunkElements = kRawChunkElements;
+  size_t prewarmRawChunkElements = 0;
 };
 
 void fail(const char* expression, const char* detail, int rank,
@@ -84,9 +91,18 @@ Options parseOptions(int argc, char** argv, int worldRank) {
     else if (key == "--topology") options.topology = value;
     else if (key == "--operation") options.operation = value;
     else if (key == "--algorithm") options.algorithm = value;
+    else if (key == "--path") options.path = value;
     else if (key == "--depth") options.depth = std::atoi(value.c_str());
+    else if (key == "--inplace") options.inPlace = std::atoi(value.c_str());
+    else if (key == "--alternate-stream") {
+      options.alternateStream = std::atoi(value.c_str());
+    }
     else if (key == "--raw-chunk-elements") {
       options.rawChunkElements = std::strtoull(value.c_str(), nullptr, 10);
+    }
+    else if (key == "--prewarm-raw-chunk-elements") {
+      options.prewarmRawChunkElements =
+          std::strtoull(value.c_str(), nullptr, 10);
     }
     else fail("command line", "unknown option", worldRank, __FILE__, __LINE__);
   }
@@ -102,6 +118,7 @@ const char* operationName(Operation operation) {
   switch (operation) {
     case Operation::AllToAll: return "alltoall";
     case Operation::AllGather: return "allgather";
+    case Operation::AllGatherTwoShot: return "allgather";
     case Operation::ReduceScatterOneShot: return "reducescatter";
     case Operation::ReduceScatterTwoShot: return "reducescatter";
     case Operation::AllReduceOneShot: return "allreduce";
@@ -117,6 +134,7 @@ const char* algorithmName(Operation operation, bool subAdd) {
   switch (operation) {
     case Operation::ReduceScatterOneShot:
     case Operation::AllReduceOneShot: return "oneshot";
+    case Operation::AllGatherTwoShot:
     case Operation::ReduceScatterTwoShot:
     case Operation::AllReduceTwoShot: return "twoshot";
     case Operation::AllReduceTripleShot: return "tripleshot";
@@ -143,9 +161,9 @@ bool selectedOperation(const Options& options, Operation operation,
 
 size_t inputElements(Operation operation, int ranks,
                      size_t rawChunkElements) {
-  if (rawChunkElements == 0) return kElementsPerRank;
   switch (operation) {
     case Operation::AllGather:
+    case Operation::AllGatherTwoShot:
     case Operation::SendRecv:
       return rawChunkElements;
     default:
@@ -155,7 +173,9 @@ size_t inputElements(Operation operation, int ranks,
 
 size_t outputElements(Operation operation, int ranks, size_t inputCount) {
   switch (operation) {
-    case Operation::AllGather: return inputCount * ranks;
+    case Operation::AllGather:
+    case Operation::AllGatherTwoShot:
+      return inputCount * ranks;
     case Operation::ReduceScatterOneShot:
     case Operation::ReduceScatterTwoShot: return inputCount / ranks;
     default: return inputCount;
@@ -215,44 +235,81 @@ void runNative(Operation operation, const void* input, void* output,
                ncclDataType_t datatype, ncclComm_t comm,
                cudaStream_t stream, int rank, int ranks,
                size_t inputCount) {
+  // A second communicator alone does not bypass process-wide COCCL routing.
+  cocclInfo info;
+  info.sendbuff = input;
+  info.recvbuff = output;
+  info.count = inputCount;
+  info.datatype = datatype;
+  info.op = ncclSum;
+  info.comm = comm;
+  info.stream = stream;
   switch (operation) {
     case Operation::AllToAll:
-      NCCLCHECK(ncclAllToAll(input, output, inputCount / ranks,
-                             datatype, comm, stream));
-      return;
+      info.operation = cocclOperation::AllToAll;
+      info.count /= ranks;
+      break;
     case Operation::AllGather:
-      NCCLCHECK(ncclAllGather(input, output, inputCount, datatype,
-                              comm, stream));
-      return;
+    case Operation::AllGatherTwoShot:
+      info.operation = cocclOperation::AllGather;
+      break;
     case Operation::ReduceScatterOneShot:
     case Operation::ReduceScatterTwoShot:
-      NCCLCHECK(ncclReduceScatter(input, output, inputCount / ranks,
-                                  datatype, ncclSum, comm, stream));
-      return;
+      info.operation = cocclOperation::ReduceScatter;
+      info.count /= ranks;
+      break;
     case Operation::AllReduceOneShot:
     case Operation::AllReduceTwoShot:
     case Operation::AllReduceTripleShot:
-      NCCLCHECK(ncclAllReduce(input, output, inputCount, datatype,
-                              ncclSum, comm, stream));
-      return;
-    case Operation::SendRecv: {
-      const int previous = (rank + ranks - 1) % ranks;
-      const int next = (rank + 1) % ranks;
+      info.operation = cocclOperation::AllReduce;
+      break;
+    case Operation::SendRecv:
+      info.operation = cocclOperation::SendRecv;
       NCCLCHECK(ncclGroupStart());
-      NCCLCHECK(ncclRecv(output, inputCount, datatype, previous, comm,
-                         stream));
-      NCCLCHECK(ncclSend(input, inputCount, datatype, next, comm,
-                         stream));
+      info.func = ncclFuncRecv;
+      info.peer = (rank + ranks - 1) % ranks;
+      NCCLCHECK(cocclReplayNativeCall(info));
+      info.func = ncclFuncSend;
+      info.peer = (rank + 1) % ranks;
+      NCCLCHECK(cocclReplayNativeCall(info));
       NCCLCHECK(ncclGroupEnd());
       return;
-    }
   }
+  NCCLCHECK(cocclReplayNativeCall(info));
 }
 
 void runCompressed(Operation operation, const void* input, void* output,
                    ncclDataType_t datatype, ncclComm_t comm,
                    cudaStream_t stream, int rank, int ranks,
-                   size_t inputCount) {
+                   size_t inputCount, bool autoRoute) {
+  if (autoRoute) {
+    switch (operation) {
+      case Operation::AllToAll:
+        NCCLCHECK(ncclAlltoAll(input, output, inputCount / ranks,
+                              datatype, comm, stream));
+        return;
+      case Operation::AllGather:
+      case Operation::AllGatherTwoShot:
+        NCCLCHECK(ncclAllGather(
+            input, output, inputCount, datatype, comm, stream));
+        return;
+      case Operation::ReduceScatterOneShot:
+      case Operation::ReduceScatterTwoShot:
+        NCCLCHECK(ncclReduceScatter(
+            input, output, inputCount / ranks, datatype, ncclSum, comm,
+            stream));
+        return;
+      case Operation::AllReduceOneShot:
+      case Operation::AllReduceTwoShot:
+      case Operation::AllReduceTripleShot:
+        NCCLCHECK(ncclAllReduce(
+            input, output, inputCount, datatype, ncclSum, comm, stream));
+        return;
+      default:
+        break;
+    }
+  }
+
   switch (operation) {
     case Operation::AllToAll:
       NCCLCHECK(cocclAllToAllComp(input, output, inputCount / ranks,
@@ -261,6 +318,10 @@ void runCompressed(Operation operation, const void* input, void* output,
     case Operation::AllGather:
       NCCLCHECK(cocclAllGatherComp(input, output, inputCount, datatype,
                                    comm, stream));
+      return;
+    case Operation::AllGatherTwoShot:
+      NCCLCHECK(cocclAllGatherCompTwoShot(
+          input, output, inputCount, datatype, comm, stream));
       return;
     case Operation::ReduceScatterOneShot:
       NCCLCHECK(cocclReduceScatterCompOneShot(
@@ -315,73 +376,152 @@ void runCase(Operation operation, bool subAdd, ncclDataType_t datatype,
   CUDACHECK(cudaMalloc(&nativeOutput, outputBytes));
   CUDACHECK(cudaMalloc(&compressedOutput, outputBytes));
 
+  T* nativeInPlace = nullptr;
+  T* compressedInPlace = nullptr;
+  size_t inputOffset = 0;
+  size_t outputOffset = 0;
+  if (options.inPlace) {
+    if (operation == Operation::AllGather ||
+        operation == Operation::AllGatherTwoShot) {
+      inputOffset = (size_t)worldRank * inputCount;
+    } else if (operation == Operation::ReduceScatterOneShot ||
+               operation == Operation::ReduceScatterTwoShot) {
+      outputOffset = (size_t)worldRank * outputCount;
+    }
+    const size_t storageBytes = std::max(inputBytes, outputBytes);
+    CUDACHECK(cudaMalloc(&nativeInPlace, storageBytes));
+    CUDACHECK(cudaMalloc(&compressedInPlace, storageBytes));
+  }
+
   if (subAdd) {
     const std::vector<T> initial = makeInput<T>(worldRank, 0, inputCount);
     CUDACHECK(cudaMemcpyAsync(deviceInput, initial.data(), inputBytes,
                               cudaMemcpyHostToDevice, compressedStream));
     MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
-    runCompressed(operation, deviceInput, compressedOutput, datatype,
-                  compressedComm, compressedStream, worldRank, worldSize,
-                  inputCount);
+    // Prime every configured state slot, including serial pipeline execution.
+    for (int slot = 0; slot < options.depth; ++slot) {
+      runCompressed(operation, deviceInput, compressedOutput, datatype,
+                    compressedComm, compressedStream, worldRank, worldSize,
+                    inputCount, options.path == "auto");
+    }
     CUDACHECK(cudaStreamSynchronize(compressedStream));
   }
 
+  cudaStream_t alternateStream = nullptr;
+  if (options.alternateStream && worldRank % 2 == 0) {
+    CUDACHECK(cudaStreamCreateWithFlags(&alternateStream, cudaStreamNonBlocking));
+    compressedStream = alternateStream;
+  }
   const std::vector<T> input = makeInput<T>(
       worldRank, subAdd ? 1 : 0, inputCount);
-  CUDACHECK(cudaMemcpyAsync(deviceInput, input.data(), inputBytes,
-                            cudaMemcpyHostToDevice, nativeStream));
-  CUDACHECK(cudaMemsetAsync(
-      nativeOutput, 0, outputBytes, nativeStream));
-  CUDACHECK(cudaMemsetAsync(
-      compressedOutput, 0, outputBytes, compressedStream));
+  const T* nativeInput = deviceInput;
+  const T* compressedInput = deviceInput;
+  T* nativeResult = nativeOutput;
+  T* compressedResult = compressedOutput;
+  if (options.inPlace) {
+    const size_t storageBytes = std::max(inputBytes, outputBytes);
+    CUDACHECK(cudaMemsetAsync(nativeInPlace, 0, storageBytes, nativeStream));
+    CUDACHECK(cudaMemsetAsync(
+        compressedInPlace, 0, storageBytes, compressedStream));
+    CUDACHECK(cudaMemcpyAsync(nativeInPlace + inputOffset, input.data(),
+                              inputBytes, cudaMemcpyHostToDevice,
+                              nativeStream));
+    CUDACHECK(cudaMemcpyAsync(compressedInPlace + inputOffset, input.data(),
+                              inputBytes, cudaMemcpyHostToDevice,
+                              compressedStream));
+    nativeInput = nativeInPlace + inputOffset;
+    compressedInput = compressedInPlace + inputOffset;
+    nativeResult = nativeInPlace + outputOffset;
+    compressedResult = compressedInPlace + outputOffset;
+  } else {
+    CUDACHECK(cudaMemcpyAsync(deviceInput, input.data(), inputBytes,
+                              cudaMemcpyHostToDevice, nativeStream));
+    CUDACHECK(cudaMemsetAsync(nativeOutput, 0, outputBytes, nativeStream));
+    CUDACHECK(cudaMemsetAsync(
+        compressedOutput, 0, outputBytes, compressedStream));
+  }
+
+  // Native AlltoAll does not support in-place buffers; keep its oracle disjoint.
+  if (options.inPlace && operation == Operation::AllToAll) {
+    CUDACHECK(cudaMemcpyAsync(deviceInput, input.data(), inputBytes,
+                              cudaMemcpyHostToDevice, nativeStream));
+    nativeInput = deviceInput;
+    nativeResult = nativeOutput;
+  }
 
   MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
-  runNative(operation, deviceInput, nativeOutput, datatype, nativeComm,
+  runNative(operation, nativeInput, nativeResult, datatype, nativeComm,
             nativeStream, worldRank, worldSize, inputCount);
   CUDACHECK(cudaStreamSynchronize(nativeStream));
   MPICHECK(MPI_Barrier(MPI_COMM_WORLD));
-  runCompressed(operation, deviceInput, compressedOutput, datatype,
+  runCompressed(operation, compressedInput, compressedResult, datatype,
                 compressedComm, compressedStream, worldRank, worldSize,
-                inputCount);
+                inputCount, options.path == "auto");
   CUDACHECK(cudaStreamSynchronize(compressedStream));
 
   std::vector<T> nativeHost(outputCount);
   std::vector<T> compressedHost(outputCount);
-  CUDACHECK(cudaMemcpy(nativeHost.data(), nativeOutput, outputBytes,
+  CUDACHECK(cudaMemcpy(nativeHost.data(), nativeResult, outputBytes,
                        cudaMemcpyDeviceToHost));
-  CUDACHECK(cudaMemcpy(compressedHost.data(), compressedOutput, outputBytes,
+  CUDACHECK(cudaMemcpy(compressedHost.data(), compressedResult, outputBytes,
                        cudaMemcpyDeviceToHost));
 
-  double localError = 0.0;
+  double localRelativeError = 0.0;
+  double localAbsoluteError = 0.0;
+  double localExpectedMagnitude = 0.0;
+  double localMaxAbsoluteError = 0.0;
   for (size_t index = 0; index < outputCount; ++index) {
     const double expected = static_cast<double>(toFloat(nativeHost[index]));
     const double actual = static_cast<double>(toFloat(compressedHost[index]));
-    localError += std::fabs(actual - expected) /
-        (std::fabs(expected) + 1.0e-6);
+    const double absoluteError = std::fabs(actual - expected);
+    localRelativeError += absoluteError / (std::fabs(expected) + 1.0e-6);
+    localAbsoluteError += absoluteError;
+    localExpectedMagnitude += std::fabs(expected);
+    if (absoluteError > localMaxAbsoluteError) {
+      localMaxAbsoluteError = absoluteError;
+    }
   }
-  double globalError = 0.0;
-  MPICHECK(MPI_Reduce(&localError, &globalError, 1, MPI_DOUBLE, MPI_SUM, 0,
+  const double localSums[] = {
+      localRelativeError, localAbsoluteError, localExpectedMagnitude};
+  double globalSums[3] = {};
+  double globalMaxAbsoluteError = 0.0;
+  MPICHECK(MPI_Reduce(localSums, globalSums, 3, MPI_DOUBLE, MPI_SUM, 0,
                       MPI_COMM_WORLD));
+  MPICHECK(MPI_Reduce(&localMaxAbsoluteError, &globalMaxAbsoluteError, 1,
+                      MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD));
   if (worldRank == 0) {
-    const double mean = globalError /
+    const double samples =
         static_cast<double>(outputCount * static_cast<size_t>(worldSize));
+    const double meanRelativeError = globalSums[0] / samples;
+    const double meanAbsoluteError = globalSums[1] / samples;
+    const double relativeL1Error = globalSums[1] / (globalSums[2] + 1.0e-12);
     std::printf(
         "COCCL_CORRECTNESS topology=%s rank_count=%d operation=%s "
-        "algorithm=%s compressor=%s dtype=%s depth=%d "
+        "algorithm=%s compressor=%s path=%s dtype=%s depth=%d "
+        "inplace=%d alternate_stream=%d "
         "raw_chunk_elements=%zu output_elements=%zu "
-        "mean_relative_error=%.12e\n",
+        "mean_relative_error=%.12e mean_absolute_error=%.12e "
+        "relative_l1_error=%.12e max_absolute_error=%.12e\n",
         options.topology.c_str(), worldSize, operationName(operation),
         algorithmName(operation, subAdd), options.compressor.c_str(),
-        options.datatype.c_str(), options.depth,
-        operation == Operation::AllGather || operation == Operation::SendRecv
+        options.path.c_str(), options.datatype.c_str(), options.depth,
+        options.inPlace ? 1 : 0,
+        options.alternateStream ? 1 : 0,
+        operation == Operation::AllGather ||
+            operation == Operation::AllGatherTwoShot ||
+            operation == Operation::SendRecv
             ? inputCount : inputCount / (size_t)worldSize,
-        outputCount, mean);
+        outputCount, meanRelativeError, meanAbsoluteError, relativeL1Error,
+        globalMaxAbsoluteError);
     std::fflush(stdout);
   }
 
   CUDACHECK(cudaFree(compressedOutput));
   CUDACHECK(cudaFree(nativeOutput));
+  CUDACHECK(cudaFree(compressedInPlace));
+  CUDACHECK(cudaFree(nativeInPlace));
   CUDACHECK(cudaFree(deviceInput));
+  if (alternateStream != nullptr) CUDACHECK(cudaStreamDestroy(alternateStream));
 }
 
 template <typename T>
@@ -398,7 +538,8 @@ void runSuite(const Options& options, ncclDataType_t datatype,
                   Operation::AllReduceTwoShot};
     operations.push_back(Operation::SendRecv);
   } else if (options.suite == "hierarchical") {
-    operations = {Operation::ReduceScatterTwoShot,
+    operations = {Operation::AllGatherTwoShot,
+                  Operation::ReduceScatterTwoShot,
                   Operation::AllReduceTripleShot};
   } else if (options.suite == "subadd") {
     operations = {Operation::AllGather};
@@ -408,6 +549,14 @@ void runSuite(const Options& options, ncclDataType_t datatype,
   }
   for (Operation operation : operations) {
     if (!selectedOperation(options, operation, subAdd)) continue;
+    if (options.prewarmRawChunkElements != 0) {
+      Options prewarm = options;
+      prewarm.rawChunkElements = options.prewarmRawChunkElements;
+      prewarm.prewarmRawChunkElements = 0;
+      runCase<T>(operation, subAdd, datatype, prewarm, nativeComm,
+                 compressedComm, nativeStream, compressedStream, worldRank,
+                 worldSize);
+    }
     runCase<T>(operation, subAdd, datatype, options, nativeComm,
                compressedComm, nativeStream, compressedStream, worldRank,
                worldSize);

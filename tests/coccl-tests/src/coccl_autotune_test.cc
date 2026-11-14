@@ -1,4 +1,5 @@
 #include "core/tuning/coccl_autotune_internal.h"
+#include "core/tuning/coccl_autotune_pipeline.h"
 
 #include <cmath>
 #include <cstdio>
@@ -76,14 +77,29 @@ void testEligibilityAndFallback() {
       cocclAutotuneBuildCandidates(cocclOperation::AllReduce, hierarchical);
   const cocclAutotuneCandidateSet arTail =
       cocclAutotuneBuildCandidates(cocclOperation::AllReduce, tail);
+  const cocclAutotuneCandidateSet agFlat =
+      cocclAutotuneBuildCandidates(cocclOperation::AllGather, flat);
+  const cocclAutotuneCandidateSet agHierarchical =
+      cocclAutotuneBuildCandidates(cocclOperation::AllGather, hierarchical);
 
-  if (rsFlat.count != 1 || rsHierarchical.count != 2 ||
+  if (agFlat.count != 1 || agHierarchical.count != 2 ||
+      rsFlat.count != 1 || rsHierarchical.count != 2 ||
       arFlat.count != 2 || arHierarchical.count != 3 ||
       arTail.count != 0) {
     fail("candidate eligibility count mismatch");
   }
   rows.push_back({"allreduce_tail_rejects_oneshot", "", "none", 0, 0,
                   "PASS"});
+
+  expectDecision("allgather_flat_heuristic", agFlat,
+                 cocclAlgorithmNone, false,
+                 cocclAlgorithmAllGatherOneShot, false, false);
+  expectDecision("allgather_hierarchical_heuristic", agHierarchical,
+                 cocclAlgorithmNone, false,
+                 cocclAlgorithmAllGatherOneShot, false, false);
+  expectDecision("forced_allgather_fallback", agFlat,
+                 cocclAlgorithmAllGatherTwoShot, true,
+                 cocclAlgorithmAllGatherOneShot, false, true);
 
   expectDecision("reducescatter_flat_heuristic", rsFlat,
                  cocclAlgorithmNone, false,
@@ -131,6 +147,19 @@ void testModelSelection() {
   expectDecision("partial_model_whole_fallback", candidates,
                  cocclAlgorithmNone, true,
                  cocclAlgorithmAllReduceTwoShot, false, false);
+
+  cocclAutotuneCandidateSet allGather =
+      cocclAutotuneBuildCandidates(
+          cocclOperation::AllGather, hierarchical);
+  setScore(&allGather, cocclAlgorithmAllGatherOneShot, 20.0);
+  setScore(&allGather, cocclAlgorithmAllGatherTwoShot, 10.0);
+  expectDecision("allgather_minimum_finite_cost", allGather,
+                 cocclAlgorithmNone, true,
+                 cocclAlgorithmAllGatherTwoShot, true, false);
+  setScore(&allGather, cocclAlgorithmAllGatherOneShot, 10.0);
+  expectDecision("allgather_stable_tie", allGather,
+                 cocclAlgorithmNone, true,
+                 cocclAlgorithmAllGatherOneShot, true, false);
 }
 
 void testCostModel() {
@@ -143,8 +172,17 @@ void testCostModel() {
     fail("linear model mismatch");
   }
 
+  const cocclLinearModel sampled = cocclAutotuneFitLinearModel(
+      {{1.0, 1.0}, {2.0, 2.0}, {4.0, 10.0}});
+  if (!sampled.valid || sampled.sampleCount != 3 ||
+      std::abs(cocclAutotunePredict(sampled, 3.0) - 6.0) > 1e-12) {
+    fail("sampled latency interpolation mismatch");
+  }
+
   const cocclSelectionPerformanceModel performance = {
-      {1.0, 0.001, true}, {2.0, 0.002, true}};
+      {1.0, 0.001, true}, {2.0, 0.002, true},
+      {5.0, 0.005, true}, {7.0, 0.007, true},
+      {4.0, 0.004, true}, {6.0, 0.006, true}};
   const cocclCodecModel codec = {
       {3.0, 0.003, true}, 2.0, true};
   const cocclAutotuneCodecSet codecs = {
@@ -158,11 +196,44 @@ void testCostModel() {
     }
   }
 
+  const double allGatherOne = cocclAutotuneEvaluateCost(
+      cocclAutotuneCostKind::AllGatherOneShot, performance,
+      codecs, 1024.0, 4, 2);
+  const double allGatherTwo = cocclAutotuneEvaluateCost(
+      cocclAutotuneCostKind::AllGatherTwoShot, performance,
+      codecs, 1024.0, 4, 2);
+  if (!std::isfinite(allGatherOne) || !std::isfinite(allGatherTwo) ||
+      allGatherOne == allGatherTwo) {
+    fail("allgather algorithm cost model mismatch");
+  }
+
   const double oneShot = cocclAutotuneEvaluateCost(
       cocclAutotuneCostKind::AllReduceOneShot, performance,
       codecs, 1024.0, 4, 2);
   if (std::abs(oneShot - 34.9072) > 1e-9) {
     fail("allreduce oneshot must include intra-node and inter-node phases");
+  }
+
+  const double flatOneRank = cocclAutotuneEvaluateCost(
+      cocclAutotuneCostKind::AllReduceOneShot, performance,
+      codecs, 1024.0, 1, 1);
+  const double flatFourRanks = cocclAutotuneEvaluateCost(
+      cocclAutotuneCostKind::AllReduceOneShot, performance,
+      codecs, 1024.0, 4, 1);
+  if (std::abs((flatFourRanks - flatOneRank) - 4.608) > 1e-9) {
+    fail("flat allreduce oneshot must decode one message per rank");
+  }
+
+  const cocclAutotuneCodecSet fusedCodecs = {
+      {true, &codec}, {true, &codec}, {true, &codec}, true, true};
+  const double regularTwoShot = cocclAutotuneEvaluateCost(
+      cocclAutotuneCostKind::ReduceScatterTwoShot, performance,
+      codecs, 1024.0, 4, 2);
+  const double fusedTwoShot = cocclAutotuneEvaluateCost(
+      cocclAutotuneCostKind::ReduceScatterTwoShot, performance,
+      fusedCodecs, 1024.0, 4, 2);
+  if (std::abs((regularTwoShot - fusedTwoShot) - 3.768) > 1e-9) {
+    fail("fused DRC must not charge a second full codec pass");
   }
 
   const cocclCodecModel invalidCodec;
@@ -173,8 +244,68 @@ void testCostModel() {
           invalidCodecs, 1024.0, 4, 2))) {
     fail("invalid model returned finite cost");
   }
+
+  cocclSelectionPerformanceModel sampledPerformance = performance;
+  sampledPerformance.intraP2p.sampleCount = 2;
+  sampledPerformance.intraP2p.sampleBytes[0] = 256.0;
+  sampledPerformance.intraP2p.sampleBytes[1] = 1024.0;
+  sampledPerformance.intraP2p.sampleTimeUs[0] = 40.0;
+  sampledPerformance.intraP2p.sampleTimeUs[1] = 80.0;
+  sampledPerformance.interP2p = sampledPerformance.intraP2p;
+  sampledPerformance.allGather = {5.0, 0.02, true};
+  sampledPerformance.allToAll = {7.0, 0.001, true};
+  cocclCodecModel sampledCodec = codec;
+  sampledCodec.drcTime = {1.0, 0.0005, true};
+  const cocclAutotuneCodecSet sampledCodecs = {
+      {true, &sampledCodec}, {true, &sampledCodec},
+      {true, &sampledCodec}};
+
+  const double smallOne = cocclAutotuneEvaluateCost(
+      cocclAutotuneCostKind::AllReduceOneShot, sampledPerformance,
+      sampledCodecs, 512.0, 4, 1);
+  const double smallTwo = cocclAutotuneEvaluateCost(
+      cocclAutotuneCostKind::AllReduceTwoShot, sampledPerformance,
+      sampledCodecs, 512.0, 4, 1);
+  const double largeOne = cocclAutotuneEvaluateCost(
+      cocclAutotuneCostKind::AllReduceOneShot, sampledPerformance,
+      sampledCodecs, 4096.0, 4, 1);
+  const double largeTwo = cocclAutotuneEvaluateCost(
+      cocclAutotuneCostKind::AllReduceTwoShot, sampledPerformance,
+      sampledCodecs, 4096.0, 4, 1);
+  if (!(smallOne < smallTwo && largeTwo < largeOne)) {
+    fail("single-node crossover model mismatch");
+  }
+
+  const double rsOne = cocclAutotuneEvaluateCost(
+      cocclAutotuneCostKind::ReduceScatterOneShot, sampledPerformance,
+      codecs, 1024.0, 4, 2);
+  const double rsTwo = cocclAutotuneEvaluateCost(
+      cocclAutotuneCostKind::ReduceScatterTwoShot, sampledPerformance,
+      codecs, 1024.0, 4, 2);
+  if (!(rsTwo < rsOne)) fail("hierarchical reducescatter model mismatch");
+
+  const double triple = cocclAutotuneEvaluateCost(
+      cocclAutotuneCostKind::AllReduceTripleShot, sampledPerformance,
+      codecs, 1024.0, 4, 2);
+  const double one = cocclAutotuneEvaluateCost(
+      cocclAutotuneCostKind::AllReduceOneShot, sampledPerformance,
+      codecs, 1024.0, 4, 2);
+  if (!(triple < one)) {
+    fail("hierarchical allreduce model mismatch");
+  }
   rows.push_back({"cost_model_and_invalid_infinity", "all", "all", 1, 0,
                   "PASS"});
+}
+
+void testPipelineDepthSelection() {
+  if (cocclPipelineDepthForSlice(32ULL << 20, 32ULL << 20) != 1 ||
+      cocclPipelineDepthForSlice(64ULL << 20, 32ULL << 20) != 2 ||
+      cocclPipelineDepthForSlice(96ULL << 20, 32ULL << 20) != 3 ||
+      cocclPipelineDepthForSlice(1ULL << 30, 32ULL << 20, 16) != 16) {
+    fail("pipeline target-slice depth mismatch");
+  }
+  rows.push_back({"pipeline_slice_candidates", "target;cap", "slice-size",
+                  1, 0, "PASS"});
 }
 
 }  // namespace
@@ -183,6 +314,7 @@ int main() {
   testEligibilityAndFallback();
   testModelSelection();
   testCostModel();
+  testPipelineDepthSelection();
 
   std::printf("scenario,eligible_candidates,selected_algorithm,used_model,forced_fallback,status\n");
   for (const ResultRow& row : rows) {

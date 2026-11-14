@@ -19,9 +19,17 @@ struct cocclAutotuneProfilePoint {
 struct cocclSelectionPerformanceModel {
   cocclLinearModel intraP2p;
   cocclLinearModel interP2p;
+  // Native communication stages used by flat AllReduce. AllGather is keyed
+  // by bytes sent per rank; AllToAll by total bytes sent per rank.
+  cocclLinearModel allGather;
+  cocclLinearModel allToAll;
+  cocclLinearModel allGatherIntra;
+  cocclLinearModel allGatherInter;
 };
 
 enum class cocclAutotuneCostKind : uint8_t {
+  AllGatherOneShot,
+  AllGatherTwoShot,
   ReduceScatterOneShot,
   ReduceScatterTwoShot,
   AllReduceOneShot,
@@ -54,8 +62,24 @@ struct cocclAutotuneCandidateSpec {
 
 // Table order is the stable tie break. OneShot deliberately precedes the
 // other variants.
-inline constexpr std::array<cocclAutotuneCandidateSpec, 5>
+inline constexpr std::array<cocclAutotuneCandidateSpec, 7>
     kCocclAutotuneCandidateSpecs = {{
+        {cocclOperation::AllGather,
+         cocclAlgorithmAllGatherOneShot,
+         cocclAutotuneRequiresNone,
+         cocclAlgorithmAllGatherOneShot,
+         0,
+         cocclAutotuneCostKind::AllGatherOneShot,
+         cocclAutotuneScoreSlot::OneShot,
+         "oneshot"},
+        {cocclOperation::AllGather,
+         cocclAlgorithmAllGatherTwoShot,
+         cocclAutotuneRequiresHierarchical,
+         cocclAlgorithmAllGatherOneShot,
+         1,
+         cocclAutotuneCostKind::AllGatherTwoShot,
+         cocclAutotuneScoreSlot::TwoShot,
+         "twoshot"},
         {cocclOperation::ReduceScatter,
          cocclAlgorithmReduceScatterOneShot,
          cocclAutotuneRequiresNone,
@@ -129,6 +153,17 @@ struct cocclAutotuneCodecSet {
   cocclAutotunePhaseCodec defaultScope;
   cocclAutotunePhaseCodec intra;
   cocclAutotunePhaseCodec inter;
+  bool fusedIntraToInter = false;
+  bool fusedInterToDefault = false;
+  bool fusedFlatDecompressReduce = false;
+};
+
+enum class cocclAutotuneTopologyOperation : uint8_t {
+  P2pIntra,
+  P2pInter,
+  AllGather,
+  AllToAll,
+  ReduceScatter,
 };
 
 inline const cocclAutotuneCandidateSpec* cocclAutotuneFindCandidateSpec(
@@ -261,8 +296,16 @@ double cocclAutotuneEvaluateCost(
     int nodes);
 
 cocclSelectionPerformanceModel cocclAutotuneSnapshotPerformanceModel(
+    ncclComm_t ownerComm, ncclComm_t intraComm, ncclComm_t interComm,
+    ncclComm_t gatherComm);
+void cocclAutotuneSnapshotCodecModels(
     void* defaultCompressor, void* intraCompressor, void* interCompressor,
-    cocclCodecModel* defaultModel, cocclCodecModel* intraModel,
-    cocclCodecModel* interModel);
+    ncclDataType_t datatype, cocclCodecModel* defaultModel,
+    cocclCodecModel* intraModel, cocclCodecModel* interModel);
+cocclCodecModel cocclAutotuneSnapshotCodecModel(
+    void* compressor, ncclDataType_t datatype);
+cocclLinearModel cocclAutotuneSnapshotTopologyStageModel(
+    ncclComm_t comm, cocclAutotuneTopologyOperation operation);
+void cocclAutotuneTopologyCommDestroy(ncclComm_t comm);
 
 #endif

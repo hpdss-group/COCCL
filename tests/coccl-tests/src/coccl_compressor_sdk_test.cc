@@ -171,7 +171,7 @@ int testMinimalPlugin() {
   }
 
   cocclCompressorPlugin incompatible = *plugin;
-  const uint32_t legacyVersions[] = {5u, 6u, 7u};
+  const uint32_t legacyVersions[] = {5u, 6u, 7u, 8u};
   for (uint32_t legacyVersion : legacyVersions) {
     incompatible = *plugin;
     incompatible.abiVersion = legacyVersion;
@@ -332,6 +332,30 @@ int testPassthroughMetadata() {
   return 0;
 }
 
+struct PipelineStateCompressor : MinimalCompressor {
+  static constexpr bool kPipelineState = true;
+};
+
+int testPipelineContext() {
+  const auto* plugin = coccl::detail::PluginAdapter<PipelineStateCompressor>
+      ::descriptor("pipeline-state");
+  cocclCompressorExecutionContext execution = {
+      sizeof(execution), &kHostApi, nullptr, nullptr, 0, 3, 8, 2, 4,
+      2, 4, 6};
+  cocclCompressorCall call = {};
+  call.structSize = sizeof(call);
+  call.execution = &execution;
+  coccl::Context context(&call);
+  if (!(plugin->capabilities & cocclCompressorCapabilityPipelineState) ||
+      context.pipelineSlice() != 2 || context.pipelineSlices() != 4 ||
+      context.localChunkIndex() != 6 || context.rank() != 3) return 1;
+  execution.structSize = COCCL_COMPRESSOR_EXECUTION_BASE_SIZE;
+  if (context.pipelineSlices() != 0 || context.pipelineSlice() != 0 ||
+      context.localChunkIndex() != 3 ||
+      plugin->execute(&call) != ncclInvalidArgument) return 1;
+  return 0;
+}
+
 int testOptionalResources() {
   const cocclCompressorPlugin* plugin =
       coccl::detail::PluginAdapter<ResourceCompressor>::descriptor("resource");
@@ -386,7 +410,18 @@ int testOptionalResources() {
       sizeof(inputData),
       config,
       &execution,
+      config,
   };
+  ResourceCompressor::Config inputConfig = {8, false};
+  call.inputConfig = &inputConfig;
+  coccl::Context drcContext(&call);
+  if (drcContext.inputConfig<ResourceCompressor::Config>().bits != 8 ||
+      drcContext.config<ResourceCompressor::Config>().bits != 4) {
+    fprintf(stderr, "DRC input/output configs were not kept separate\n");
+    plugin->destroyConfig(config);
+    return 1;
+  }
+  call.inputConfig = config;
   cocclCompressorHostApi invalidHostApi = kHostApi;
   --invalidHostApi.abiVersion;
   execution.hostApi = &invalidHostApi;
@@ -443,7 +478,7 @@ COCCL_REGISTER_COMPRESSOR("minimal", MinimalCompressor);
 
 int main() {
   if (testMinimalPlugin() || testPassthroughMetadata() ||
-      testOptionalResources() || testFramedPlugin()) {
+      testOptionalResources() || testFramedPlugin() || testPipelineContext()) {
     return 1;
   }
   printf("COCCL compressor SDK tests passed\n");

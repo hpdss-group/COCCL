@@ -54,7 +54,7 @@ CXXFLAGS   := -std=c++11
 LDFLAGS    := -L${CUDA_LIB} -lcudart -lrt
 NVLDFLAGS  := -L${CUDA_LIB} -l${CUDARTLIB} -lrt
 
-ifeq ($(DEBUG), 0)
+ifneq ($(filter 0 release,$(DEBUG)),)
 NVCUFLAGS += -O3 -g
 CXXFLAGS  += -O3 -g
 else
@@ -72,7 +72,7 @@ endif
 	buffer-tests pipeline-tests pipeline-layout-test compression-tests \
 	framed-tests autotune-tests autotune-model-selector-build training-tests \
 	training-mpi-build dietgpu-codec-build dietgpu-integer-build \
-	collective-correctness-build
+	collective-correctness-build coll-config-build
 
 BUILDDIR ?= ../build
 ifneq ($(NCCL_HOME), "")
@@ -95,7 +95,7 @@ DST_DIR := $(BUILDDIR)
 SRC_FILES := $(wildcard *.cu)
 OBJ_FILES := $(SRC_FILES:%.cu=${DST_DIR}/%.o)
 BIN_FILES_LIST := all_reduce all_gather broadcast reduce_scatter reduce alltoall scatter gather sendrecv hypercube \
-alltoall_comp alltoall_p2p all_gather_comp all_reduce_comp_twoshot \
+alltoall_comp alltoall_p2p all_gather_comp all_gather_comp_twoshot all_reduce_comp_twoshot \
 reduce_scatter_comp_oneshot reduce_scatter_comp_twoshot \
 all_reduce_comp_tripleshot sendrecv_comp all_reduce_comp_oneshot
 BIN_FILES := $(BIN_FILES_LIST:%=${DST_DIR}/%_perf)
@@ -106,9 +106,14 @@ COCCL_SRC := ../../../src
 COCCL_ROOT := $(COCCL_SRC)/coccl-extend
 COCCL_CORE := $(COCCL_ROOT)/core
 COCCL_EXTENSIONS := $(COCCL_ROOT)/extensions
+BACKEND_COLLECTIVES_SRC := $(COCCL_CORE)/backend/coccl_backend_collectives.cc
+BACKEND_TOPOLOGY_SRC := $(COCCL_CORE)/backend/coccl_backend_topology.cc
 COCCL_INC := -I$(COCCL_ROOT)/include -I$(COCCL_ROOT) \
-	-I$(COCCL_SRC)/include -I$(NCCL_HOME)/include -I$(CUDA_INC)
-TEST_CXXFLAGS := $(filter-out -std=c++11,$(CXXFLAGS)) -std=c++17
+	-I$(COCCL_SRC)/include -I$(COCCL_SRC)/include/plugin \
+	-I$(NCCL_HOME)/include -I$(CUDA_INC) -DNCCL_OS_LINUX
+TEST_DEBUG_STUB_OBJ := $(DST_DIR)/coccl_test_debug_stub.o
+TEST_CXXFLAGS := $(filter-out -std=c++11,$(CXXFLAGS)) -std=c++17 \
+	-ffunction-sections -fdata-sections -Wl,--gc-sections $(TEST_DEBUG_STUB_OBJ)
 SDK_TEST := $(DST_DIR)/coccl_compressor_sdk_test
 CONFIG_READER_TEST := $(DST_DIR)/coccl_config_reader_test
 CONFIG_POLICY_TEST := $(DST_DIR)/coccl_config_policy_test
@@ -143,8 +148,11 @@ DIETGPU_CODEC_TEST := $(DST_DIR)/coccl_dietgpu_codec_test
 SWIZZLE_PLAN_TEST := $(DST_DIR)/coccl_swizzle_plan_test
 REDUCESCATTER_RECIPE_TEST := $(DST_DIR)/coccl_reducescatter_recipe_test
 COLLECTIVE_CORRECTNESS_TEST := $(DST_DIR)/coccl_collective_correctness
+COLL_CONFIG_TEST := $(DST_DIR)/coccl_coll_config_test
 AUTOTUNE_TEST := $(DST_DIR)/coccl_autotune_test
 AUTOTUNE_MODEL_SELECTOR := $(DST_DIR)/coccl_autotune_model_selector
+AUTOTUNE_TOPOLOGY_TEST := $(DST_DIR)/coccl_autotune_topology_test
+AUTOTUNE_PIPELINE_QUERY_TEST := $(DST_DIR)/coccl_autotune_pipeline_query_test
 AUTOTUNE_COST_MODEL_SRC := $(COCCL_CORE)/tuning/coccl_autotune_cost_model.cc
 AUTOTUNE_INTERNAL := $(COCCL_CORE)/tuning/coccl_autotune_internal.h
 SCOPE_CONFIG_TEST := $(DST_DIR)/coccl_scope_config_test
@@ -158,6 +166,27 @@ TRAINING_CONFIG := ../../../examples/training_scripts/configs/training.toml
 CONFIG_TEST_TMP := $(DST_DIR)/config-test-tmp
 DIETGPU_INTEGER_TEST := $(DST_DIR)/coccl_dietgpu_integer_test
 
+HOST_TEST_BINS := $(SDK_TEST) $(CONFIG_READER_TEST) $(CONFIG_POLICY_TEST) \
+	$(PLUGIN_LOAD_TEST) $(RUNTIME_TEST) $(GROUP_TEST) \
+	$(BUFFER_MANAGER_TEST) $(VMM_BUFFER_TEST) $(PIPELINE_PLAN_TEST) \
+	$(PIPELINE_STAGE_TEST) $(ALLGATHER_PLAN_TEST) $(ALLGATHER_STAGE_TEST) \
+	$(REDUCESCATTER_PLAN_TEST) $(REDUCESCATTER_STAGE_TEST) \
+	$(ALLREDUCE_PLAN_TEST) $(ALLREDUCE_RECIPE_TEST) \
+	$(FIXED_COMPRESSOR_TEST) $(UNIFIED_ARENA_TEST) $(SIZE_QUERY_TEST) \
+	$(PIPELINE_WORKSPACE_TEST) $(INPLACE_PLAN_TEST) $(FRAME_EXCHANGE_TEST) \
+	$(GROUP_BATCH_TEST) $(FRAMED_PIPELINE_PLAN_TEST) $(AUTOTUNE_TEST) \
+	$(AUTOTUNE_TOPOLOGY_TEST) \
+	$(AUTOTUNE_MODEL_SELECTOR) \
+	$(SCOPE_CONFIG_TEST) $(HIERARCHICAL_GRAPH_TEST) $(CODEC_FLOW_TEST) \
+	$(SELECTOR_SCOPE_TEST) $(REMAINDER_PLAN_TEST) $(TRAINING_CLASSIFIER_TEST)
+
+$(HOST_TEST_BINS): | $(TEST_DEBUG_STUB_OBJ)
+
+$(TEST_DEBUG_STUB_OBJ): coccl_test_debug_stub.cc
+	@mkdir -p $(DST_DIR)
+	$(CXX) $(filter-out $(TEST_DEBUG_STUB_OBJ),$(TEST_CXXFLAGS)) \
+		$(COCCL_INC) -c $< -o $@
+
 host-tests: config-tests runtime-tests buffer-tests pipeline-tests \
 	compression-tests framed-tests autotune-tests training-tests
 
@@ -166,7 +195,7 @@ config-tests: $(SDK_TEST) $(CONFIG_READER_TEST) $(CONFIG_POLICY_TEST) \
 	@mkdir -p $(CONFIG_TEST_TMP)
 	$(SDK_TEST)
 	$(CONFIG_READER_TEST)
-	$(CONFIG_POLICY_TEST) $(SDP_CONFIG) $(ZFP_CONFIG)
+	$(CONFIG_POLICY_TEST) $(SDP_CONFIG) $(ZFP_CONFIG) $(PLUGIN_DIR)
 	$(SCOPE_CONFIG_TEST) $(CONFIG_TEST_TMP) $(SDP_CONFIG) $(ZFP_CONFIG) \
 		../../../examples/benchmarks_scripts/configs/dietgpu.toml \
 		../../../src/coccl-extend/extensions/configs/normal-mixed.toml \
@@ -223,8 +252,12 @@ framed-tests: $(FRAMED_PIPELINE_PLAN_TEST) $(FRAME_EXCHANGE_TEST) \
 	$(FRAME_EXCHANGE_TEST)
 	$(GROUP_BATCH_TEST)
 
-autotune-tests: $(AUTOTUNE_TEST) $(SELECTOR_SCOPE_TEST)
+autotune-tests: $(AUTOTUNE_TEST) $(AUTOTUNE_TOPOLOGY_TEST) \
+		$(AUTOTUNE_PIPELINE_QUERY_TEST) \
+		$(SELECTOR_SCOPE_TEST)
 	$(AUTOTUNE_TEST)
+	$(AUTOTUNE_TOPOLOGY_TEST)
+	$(AUTOTUNE_PIPELINE_QUERY_TEST)
 	$(SELECTOR_SCOPE_TEST)
 
 training-tests: $(TRAINING_CLASSIFIER_TEST)
@@ -240,6 +273,8 @@ dietgpu-integer-build: $(DIETGPU_INTEGER_TEST)
 
 collective-correctness-build: $(COLLECTIVE_CORRECTNESS_TEST)
 
+coll-config-build: $(COLL_CONFIG_TEST)
+
 $(SDK_TEST): coccl_compressor_sdk_test.cc
 	@printf "Linking  %-35s > %s\n" $< $@
 	@mkdir -p $(DST_DIR)
@@ -251,12 +286,13 @@ $(CONFIG_READER_TEST): coccl_config_reader_test.cc
 	$(CXX) $(TEST_CXXFLAGS) $(COCCL_INC) -o $@ $<
 
 $(CONFIG_POLICY_TEST): coccl_config_policy_test.cc \
+		$(COCCL_CORE)/compression/coccl_compressor_registry.cc \
 		$(COCCL_CORE)/config/coccl_config.cc \
 		$(COCCL_CORE)/runtime/coccl_operation.cc
 	@printf "Linking  %-35s > %s\n" $< $@
 	@mkdir -p $(DST_DIR)
 	$(CXX) $(TEST_CXXFLAGS) -DCOCCL_CONFIG_PARSER_ONLY $(COCCL_INC) \
-		-o $@ $^
+		-o $@ $^ -ldl
 
 $(PLUGIN_LOAD_TEST): coccl_plugin_load_test.cc
 	@printf "Linking  %-35s > %s\n" $< $@
@@ -294,7 +330,8 @@ $(INPLACE_PLAN_TEST): coccl_inplace_plan_test.cc \
 	$(CXX) $(TEST_CXXFLAGS) $(COCCL_INC) -I$(COCCL_SRC) -o $@ $^
 
 $(FRAME_EXCHANGE_TEST): coccl_frame_exchange_test.cc \
-		$(COCCL_CORE)/pipeline/coccl_frame_exchange.cc
+		$(COCCL_CORE)/communication/coccl_frame_exchange.cc \
+		$(COCCL_CORE)/backend/coccl_backend_framed.cc
 	@printf "Linking  %-35s > %s\n" $< $@
 	@mkdir -p $(DST_DIR)
 	$(CXX) $(TEST_CXXFLAGS) $(COCCL_INC) -I$(COCCL_SRC) -o $@ $^
@@ -329,7 +366,15 @@ $(REDUCESCATTER_RECIPE_TEST): coccl_reducescatter_recipe_test.cc \
 	@mkdir -p $(DST_DIR)
 	$(CXX) $(TEST_CXXFLAGS) $(COCCL_INC) -I$(COCCL_SRC) -o $@ $^
 
-$(COLLECTIVE_CORRECTNESS_TEST): coccl_collective_correctness.cu
+$(COLLECTIVE_CORRECTNESS_TEST): coccl_collective_correctness.cu \
+		$(NCCL_HOME)/lib/libnccl_static.a
+	@printf "Linking  %-35s > %s\n" $< $@
+	@mkdir -p $(DST_DIR)
+	$(NVCC) -o $@ $(filter-out -std=c++11,$(NVCUFLAGS)) -std=c++17 \
+		$(COCCL_INC) $< $(NCCL_HOME)/lib/libnccl_static.a \
+		$(filter-out -lnccl -l$(CUDARTLIB),$(NVLDFLAGS)) -lcudart_static -ldl -lpthread
+
+$(COLL_CONFIG_TEST): coccl_coll_config_test.cu
 	@printf "Linking  %-35s > %s\n" $< $@
 	@mkdir -p $(DST_DIR)
 	$(NVCC) -o $@ $(NVCUFLAGS) $< $(NVLDFLAGS)
@@ -348,6 +393,25 @@ $(AUTOTUNE_MODEL_SELECTOR): coccl_autotune_model_selector.cc \
 	$(CXX) $(TEST_CXXFLAGS) $(COCCL_INC) -I$(COCCL_SRC) \
 		-o $@ $< $(AUTOTUNE_COST_MODEL_SRC)
 
+$(AUTOTUNE_TOPOLOGY_TEST): coccl_autotune_topology_test.cc \
+		$(COCCL_CORE)/tuning/coccl_autotune_topology.cc \
+		$(BACKEND_TOPOLOGY_SRC) $(BACKEND_COLLECTIVES_SRC) \
+		$(AUTOTUNE_COST_MODEL_SRC) $(AUTOTUNE_INTERNAL)
+	@printf "Linking  %-35s > %s\n" $< $@
+	@mkdir -p $(DST_DIR)
+	$(CXX) $(TEST_CXXFLAGS) $(COCCL_INC) -I$(COCCL_SRC) \
+		-o $@ $< $(COCCL_CORE)/tuning/coccl_autotune_topology.cc \
+		$(BACKEND_TOPOLOGY_SRC) $(BACKEND_COLLECTIVES_SRC) \
+		$(AUTOTUNE_COST_MODEL_SRC)
+
+$(AUTOTUNE_PIPELINE_QUERY_TEST): coccl_autotune_pipeline_query_test.cc \
+		$(COCCL_CORE)/tuning/coccl_autotune_pipeline.cc \
+		$(AUTOTUNE_COST_MODEL_SRC)
+	@printf "Linking  %-35s > %s\n" $< $@
+	@mkdir -p $(DST_DIR)
+	$(CXX) $(TEST_CXXFLAGS) $(COCCL_INC) -I$(COCCL_SRC) \
+		-o $@ $^
+
 $(SCOPE_CONFIG_TEST): coccl_scope_config_test.cc \
 		$(COCCL_CORE)/config/coccl_config.cc \
 		$(COCCL_CORE)/config/coccl_config_format.cc \
@@ -365,13 +429,14 @@ $(HIERARCHICAL_GRAPH_TEST): coccl_hierarchical_graph_test.cc \
 	$(CXX) $(TEST_CXXFLAGS) $(COCCL_INC) -I$(COCCL_SRC) -o $@ $^
 
 $(CODEC_FLOW_TEST): coccl_codec_flow_test.cc \
-		$(COCCL_CORE)/pipeline/coccl_pipeline_stage.cc
+		$(COCCL_CORE)/pipeline/coccl_pipeline_stage.cc $(BACKEND_COLLECTIVES_SRC)
 	@printf "Linking  %-35s > %s\n" $< $@
 	@mkdir -p $(DST_DIR)
 	$(CXX) $(TEST_CXXFLAGS) $(COCCL_INC) -I$(COCCL_SRC) -o $@ $^ \
 		-L$(CUDA_LIB) -lcudart
 
 $(SELECTOR_SCOPE_TEST): coccl_selector_scope_test.cc \
+		$(COCCL_EXTENSIONS)/primitives/coccl_allgather.cc \
 		$(COCCL_CORE)/tuning/coccl_autotune_selector.cc \
 		$(COCCL_CORE)/tuning/coccl_autotune_cost_model.cc \
 		$(COCCL_CORE)/runtime/coccl_prepared_call.cc
@@ -385,7 +450,7 @@ $(DIETGPU_INTEGER_TEST): coccl_dietgpu_integer_test.cu
 	$(NVCC) -o $@ $(NVCUFLAGS) $< $(NVLDFLAGS)
 
 $(RUNTIME_TEST): coccl_runtime_test.cc \
-		$(COCCL_CORE)/runtime/coccl_runtime.cc \
+		$(COCCL_CORE)/runtime/coccl_runtime.cc $(BACKEND_COLLECTIVES_SRC) \
 		$(COCCL_CORE)/runtime/coccl_prepared_call.cc
 	@printf "Linking  %-35s > %s\n" $< $@
 	@mkdir -p $(DST_DIR)
@@ -426,8 +491,9 @@ $(REMAINDER_PLAN_TEST): coccl_remainder_plan_test.cc \
 
 $(TRAINING_CLASSIFIER_TEST): coccl_training_classifier_test.cc \
 		$(COCCL_CORE)/training/coccl_training_classifier.cc \
+		$(COCCL_CORE)/training/coccl_training_iteration.cc \
 		$(COCCL_CORE)/training/coccl_training_assist.cc \
-		$(COCCL_CORE)/runtime/coccl_runtime.cc \
+		$(COCCL_CORE)/runtime/coccl_runtime.cc $(BACKEND_COLLECTIVES_SRC) \
 		$(COCCL_CORE)/runtime/coccl_prepared_call.cc \
 		$(COCCL_CORE)/config/coccl_config.cc \
 		$(COCCL_CORE)/runtime/coccl_operation.cc
@@ -448,7 +514,7 @@ $(TRAINING_KNOWN_ROLES_TEST): coccl_training_known_roles.cc
 		-L$(CUDA_LIB) -lcudart -lpthread
 
 $(PIPELINE_STAGE_TEST): coccl_pipeline_stage_test.cc \
-		$(COCCL_CORE)/pipeline/coccl_pipeline_stage.cc $(FRAME_STAGE_STUB)
+		$(COCCL_CORE)/pipeline/coccl_pipeline_stage.cc $(BACKEND_COLLECTIVES_SRC) $(FRAME_STAGE_STUB)
 	@printf "Linking  %-35s > %s\n" $< $@
 	@mkdir -p $(DST_DIR)
 	$(CXX) $(TEST_CXXFLAGS) $(COCCL_INC) -I$(COCCL_SRC) -o $@ $^ \
@@ -469,7 +535,7 @@ $(ALLGATHER_PLAN_TEST): coccl_allgather_plan_test.cc \
 	$(CXX) $(TEST_CXXFLAGS) $(COCCL_INC) -I$(COCCL_SRC) -o $@ $^
 
 $(ALLGATHER_STAGE_TEST): coccl_allgather_stage_test.cc \
-		$(COCCL_CORE)/pipeline/coccl_pipeline_stage.cc $(FRAME_STAGE_STUB)
+		$(COCCL_CORE)/pipeline/coccl_pipeline_stage.cc $(BACKEND_COLLECTIVES_SRC) $(FRAME_STAGE_STUB)
 	@printf "Linking  %-35s > %s\n" $< $@
 	@mkdir -p $(DST_DIR)
 	$(CXX) $(TEST_CXXFLAGS) $(COCCL_INC) -I$(COCCL_SRC) -o $@ $^ \
@@ -482,7 +548,7 @@ $(REDUCESCATTER_PLAN_TEST): coccl_reducescatter_plan_test.cc \
 	$(CXX) $(TEST_CXXFLAGS) $(COCCL_INC) -I$(COCCL_SRC) -o $@ $^
 
 $(REDUCESCATTER_STAGE_TEST): coccl_reducescatter_stage_test.cc \
-		$(COCCL_CORE)/pipeline/coccl_pipeline_stage.cc $(FRAME_STAGE_STUB)
+		$(COCCL_CORE)/pipeline/coccl_pipeline_stage.cc $(BACKEND_COLLECTIVES_SRC) $(FRAME_STAGE_STUB)
 	@printf "Linking  %-35s > %s\n" $< $@
 	@mkdir -p $(DST_DIR)
 	$(CXX) $(TEST_CXXFLAGS) $(COCCL_INC) -I$(COCCL_SRC) -o $@ $^ \

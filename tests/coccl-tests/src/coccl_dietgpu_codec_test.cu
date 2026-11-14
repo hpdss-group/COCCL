@@ -19,6 +19,7 @@ enum class InputPattern {
   Mixed,
   Compressible,
   Random,
+  Ratio130,
 };
 
 enum class FrameExpectation {
@@ -78,13 +79,36 @@ bool guardsEqual(const std::vector<unsigned char>& bytes,
   return true;
 }
 
+size_t datatypeBytes(ncclDataType_t datatype) {
+  switch (datatype) {
+    case ncclFloat16:
+    case ncclBfloat16:
+      return 2;
+    case ncclFloat32:
+      return 4;
+    default:
+      return 1;
+  }
+}
+
+const char* datatypeName(ncclDataType_t datatype) {
+  if (datatype == ncclFloat16) return "fp16";
+  if (datatype == ncclBfloat16) return "bf16";
+  if (datatype == ncclFloat32) return "fp32";
+  return "uint8";
+}
+
 int runRoundTrip(const cocclCompressorPlugin* plugin, int probBits,
                  size_t frameBytes, size_t frames, InputPattern pattern,
-                 FrameExpectation expectation, bool printProbe) {
+                 FrameExpectation expectation, bool printProbe,
+                 ncclDataType_t datatype = ncclUint8) {
   size_t rawBytes = frameBytes * frames;
-  if (frameBytes == 0 || frames == 0 || rawBytes / frames != frameBytes) {
+  const size_t typeBytes = datatypeBytes(datatype);
+  if (frameBytes == 0 || frames == 0 || rawBytes / frames != frameBytes ||
+      frameBytes % typeBytes != 0) {
     return 1;
   }
+  const size_t rawElements = rawBytes / typeBytes;
 
   std::vector<unsigned char> input(rawBytes, 0);
   uint32_t randomState = 0x6d2b79f5u;
@@ -94,8 +118,9 @@ int runRoundTrip(const cocclCompressorPlugin* plugin, int probBits,
       continue;
     }
     for (size_t offset = 0; offset < frameBytes; ++offset) {
-      input[frame * frameBytes + offset] =
-          static_cast<unsigned char>(nextRandom(&randomState));
+      const uint32_t value = nextRandom(&randomState);
+      input[frame * frameBytes + offset] = static_cast<unsigned char>(
+          pattern == InputPattern::Ratio130 ? value & 0x3f : value);
     }
   }
 
@@ -161,7 +186,7 @@ int runRoundTrip(const cocclCompressorPlugin* plugin, int probBits,
         COCCL_COMPRESSOR_HOST_API_VERSION, sizeof(cocclCompressorHostApi),
         allocateScratch, unusedPersistent, unusedState};
     cocclCompressorExecutionContext execution = {
-        sizeof(cocclCompressorExecutionContext), &hostApi, &scratch,
+        COCCL_COMPRESSOR_EXECUTION_BASE_SIZE, &hostApi, &scratch,
         stream, 0, 0, 1, 1, 1};
     cocclCompressorFrameMetadata* deviceMetadata =
         deviceMetadataStorage + 1;
@@ -169,14 +194,14 @@ int runRoundTrip(const cocclCompressorPlugin* plugin, int probBits,
     unsigned char* deviceDecoded = deviceDecodedStorage + kGuardBytes;
 
     const cocclCompressorView raw = {
-        deviceInput, rawBytes, rawBytes, rawBytes, frames, ncclUint8,
+        deviceInput, rawBytes, rawBytes, rawElements, frames, datatype,
         nullptr, 0};
     cocclCompressorView encoded = {
         deviceEncoded, rawBytes, 0, 0, frames, ncclInt8,
         deviceMetadata, frameBytes};
     cocclCompressorCall compressCall = {
         sizeof(cocclCompressorCall), cocclCompressorOperationCompress,
-        raw, &encoded, 0, 0, ncclUint8, rawBytes, config, &execution};
+        raw, &encoded, 0, 0, datatype, rawElements, config, &execution};
     cudaEventRecord(compressBegin, stream);
     const ncclResult_t compressResult = plugin->execute(&compressCall);
     cudaEventRecord(compressEnd, stream);
@@ -191,11 +216,11 @@ int runRoundTrip(const cocclCompressorPlugin* plugin, int probBits,
         encoded.chunks, encoded.datatype, encoded.frameMetadata,
         encoded.frameStrideBytes};
     cocclCompressorView decoded = {
-        deviceDecoded, rawBytes, 0, rawBytes, frames, ncclUint8,
+        deviceDecoded, rawBytes, 0, rawElements, frames, datatype,
         nullptr, 0};
     cocclCompressorCall decompressCall = {
         sizeof(cocclCompressorCall), cocclCompressorOperationDecompress,
-        compressed, &decoded, 0, 0, ncclUint8, rawBytes, config,
+        compressed, &decoded, 0, 0, datatype, rawElements, config,
         &execution};
     cudaEventRecord(decompressBegin, stream);
     const ncclResult_t decompressResult = plugin->execute(&decompressCall);
@@ -291,11 +316,13 @@ int runRoundTrip(const cocclCompressorPlugin* plugin, int probBits,
       cudaEventElapsedTime(&encodeMs, compressBegin, compressEnd);
       cudaEventElapsedTime(&decodeMs, decompressBegin, decompressEnd);
       const char* patternName = pattern == InputPattern::Compressible
-          ? "compressible" : "random";
+          ? "compressible"
+          : (pattern == InputPattern::Ratio130 ? "ratio130" : "random");
       printf("COCCL_DIETGPU_PROBE pattern=%s prob_bits=%d raw_bytes=%zu "
-             "frames=%zu payload_bytes=%llu ratio=%.9f encode_us=%.3f "
-             "decode_us=%.3f\n",
+             "frames=%zu datatype=%s payload_bytes=%llu ratio=%.9f "
+             "encode_us=%.3f decode_us=%.3f\n",
              patternName, probBits, rawBytes, frames,
+             datatypeName(datatype),
              (unsigned long long)payloadBytes,
              static_cast<double>(payloadBytes) / rawBytes,
              encodeMs * 1000.0f, decodeMs * 1000.0f);
@@ -321,12 +348,21 @@ exit:
 
 }  // namespace
 
+ncclDataType_t parseDatatype(const char* name) {
+  if (strcmp(name, "fp16") == 0) return ncclFloat16;
+  if (strcmp(name, "bf16") == 0) return ncclBfloat16;
+  if (strcmp(name, "fp32") == 0) return ncclFloat32;
+  return ncclUint8;
+}
+
 int main(int argc, char** argv) {
-  const bool probe = argc == 7 && strcmp(argv[2], "--probe") == 0;
+  const bool probe = (argc == 7 || argc == 8) &&
+      strcmp(argv[2], "--probe") == 0;
   if (argc != 2 && !probe) {
     fprintf(stderr,
             "usage: %s /path/to/libdietgpu.so "
-            "[--probe compressible|random FRAME_BYTES FRAMES PROB_BITS]\n",
+            "[--probe compressible|random|ratio130 FRAME_BYTES FRAMES "
+            "PROB_BITS [uint8|fp16|bf16|fp32]]\n",
             argv[0]);
     return 2;
   }
@@ -353,16 +389,33 @@ int main(int argc, char** argv) {
   int result = 0;
   if (probe) {
     const InputPattern pattern = strcmp(argv[3], "compressible") == 0
-        ? InputPattern::Compressible : InputPattern::Random;
+        ? InputPattern::Compressible
+        : (strcmp(argv[3], "ratio130") == 0
+               ? InputPattern::Ratio130 : InputPattern::Random);
     result = runRoundTrip(
         plugin, atoi(argv[6]), strtoull(argv[4], nullptr, 10),
-        strtoull(argv[5], nullptr, 10), pattern, FrameExpectation::Any, true);
+        strtoull(argv[5], nullptr, 10), pattern, FrameExpectation::Any, true,
+        argc == 8 ? parseDatatype(argv[7]) : ncclUint8);
     dlclose(library);
     return result;
   }
   for (int probBits = 9; probBits <= 11 && result == 0; ++probBits) {
     result = runRoundTrip(plugin, probBits, 4096, 4, InputPattern::Mixed,
                           FrameExpectation::Mixed, false);
+  }
+  const ncclDataType_t floatTypes[] = {
+      ncclFloat16, ncclBfloat16, ncclFloat32};
+  for (ncclDataType_t datatype : floatTypes) {
+    if (result == 0) {
+      result = runRoundTrip(
+          plugin, 10, 4096, 4, InputPattern::Mixed,
+          FrameExpectation::Mixed, false, datatype);
+    }
+  }
+  if (result == 0) {
+    result = runRoundTrip(
+        plugin, 10, 65540, 3, InputPattern::Mixed,
+        FrameExpectation::Any, false, ncclFloat32);
   }
   if (result == 0) {
     result = runRoundTrip(plugin, 10, 4095, 3, InputPattern::Mixed,

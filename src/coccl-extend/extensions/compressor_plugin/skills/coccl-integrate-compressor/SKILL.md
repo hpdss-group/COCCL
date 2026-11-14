@@ -1,6 +1,6 @@
 ---
 name: coccl-integrate-compressor
-description: Integrate or migrate fixed-size or framed variable-length CUDA compression algorithms into the COCCL C++17 compressor SDK and ABI v8 while preserving the plugin's existing Makefile or CMake build. Use when Codex must adapt an external compressor, generate Config/Compressor glue, replace legacy descriptors, connect scratch/persistent/state resources, add TOML policy parameters, vendor an offline codec, or validate a compressor shared library with COCCL.
+description: Integrate or migrate fixed-size or framed variable-length CUDA compression algorithms into the COCCL C++17 compressor SDK and ABI v9 while preserving the plugin's existing Makefile or CMake build. Use when Codex must adapt an external compressor, generate Config/Compressor glue, replace legacy descriptors, connect scratch/persistent/state resources, add TOML policy parameters, vendor an offline codec, or validate a compressor shared library with COCCL.
 ---
 
 # Integrate a COCCL Compressor
@@ -47,6 +47,14 @@ the plugin's build system; add only the adapter and build bridge COCCL needs.
 - Use `Context::scratch()` only for callback-local workspace,
   `Context::persistent()` only for device memory retained across calls, and
   `Context::instance()` only when the selected algorithm path needs Host state.
+- Stateful pipeline codecs may declare `kPipelineState = true`. Use
+  `Context::pipelineSlice()` / `pipelineSlices()` for history slots and
+  `localChunkIndex()` for the sender's position in decoded rank order.
+  COCCL isolates this state by communicator and output layout,
+  and orders each history slot's reads after its preceding decoder write.
+  Do not infer the slice count from configured depth or assume hierarchical
+  decoder output is already in user rank order. The optional execution tail
+  preserves the v9 prefix supplied to existing plugins without this capability.
 - Request lazy resources inside the branch that consumes them, never during
   plugin loading or configuration.
 - Preserve logical chunk count and equal per-chunk layout. A plugin receives
@@ -71,6 +79,11 @@ the plugin's build system; add only the adapter and build bridge COCCL needs.
   acquire SDK resources. Omit it when no safe bound is available; COCCL then
   plans the corresponding uncompressed size. For DRC, the supplied shape is
   the reduced raw output and the estimate must use recompress parameters.
+- A fused DRC implementation reads the previous stage's typed configuration
+  with `context.inputConfig<Config>()` and the recompress configuration with
+  `context.config<Config>()`. Return `ncclInvalidUsage` before launching work
+  when the compressor supports DRC but that configuration pair cannot be
+  fused; Core then uses the generic fallback.
 - Return `ncclInvalidArgument` for unsupported datatypes, shapes, or parameter
   combinations. Return CUDA failures through `coccl::fromCuda()`.
 - Keep config defaults in the typed `Config`; let `ConfigReader::finish()`
